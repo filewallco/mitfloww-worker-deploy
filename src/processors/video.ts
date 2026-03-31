@@ -6,14 +6,25 @@ export function processVideo(input: string, output: string): Promise<void> {
       'ffmpeg',
       [
         '-i', input,
-        '-vf', 'scale=-2:360',
+        '-i', 'assets/watermark.png',
+
+        // scale + overlay watermark
+        '-filter_complex',
+        'scale=-2:360[video];[video][1]overlay=10:10',
+
         '-c:v', 'libx264',
         '-crf', '28',
         '-preset', 'fast',
+
+        '-c:a', 'copy',
+
         output,
       ],
-      (err: any) => {
-        if (err) return reject(err);
+      (err, stdout, stderr) => {
+        if (err) {
+          console.error(stderr);
+          return reject(err);
+        }
         resolve();
       }
     );

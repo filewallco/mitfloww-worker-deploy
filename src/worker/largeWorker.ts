@@ -6,6 +6,8 @@ import { start, done } from './admission';
 new Worker(
   'large-files',
   async (job) => {
+    console.log('Large worker started');
+
     start('large');
     try {
       await handleJob(job.data);

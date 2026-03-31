@@ -6,6 +6,8 @@ import { start, done } from './admission';
 new Worker(
   'medium-files',
   async (job) => {
+    console.log('Medium worker started');
+    
     start('medium');
     try {
       await handleJob(job.data);

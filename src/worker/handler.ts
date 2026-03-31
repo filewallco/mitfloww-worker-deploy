@@ -6,6 +6,8 @@ import fs from 'fs';
 import os from 'os'; // for windows
 
 export async function handleJob(job: FileJob) {
+  console.log('Downloading:', job.inputUrl);
+  
 // for linux
 //   const inputPath = path.join('/tmp', `${job.fileId}-input`);
 //   const outputPath = path.join('/tmp', `${job.fileId}-output.mp4`);
