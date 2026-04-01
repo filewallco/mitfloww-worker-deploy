@@ -4,13 +4,22 @@ import path from 'path';
 
 const MODE = process.env.MODE || 'local';
 
+/**
+ * Downloads a file from a URL or local file path.
+ * Handles both local file copying and HTTPS downloads.
+ *
+ * @param url - File URL or local path (prefixed with file://)
+ * @param dest - Destination path to save the file
+ */
 export async function download(url: string, dest: string) {
   if (MODE === 'local' && url.startsWith('file://')) {
+    // For local testing, just copy the file from local path
     const localPath = url.replace('file://', '');
     await fs.promises.copyFile(localPath, dest);
     return;
   }
 
+  // Download file over HTTPS
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
 
@@ -27,6 +36,7 @@ export async function download(url: string, dest: string) {
       });
     });
 
+    // Timeout after 30 seconds
     req.setTimeout(30000, () => {
       req.destroy();
       reject(new Error('Download timeout'));
@@ -36,27 +46,38 @@ export async function download(url: string, dest: string) {
   });
 }
 
+/**
+ * Uploads a file either to local storage or a remote service (R2 placeholder here).
+ * Returns the path or URL of the uploaded file.
+ *
+ * @param filePath - Path to the local file to upload
+ * @param key - Unique key or filename for the destination
+ * @returns Path or URL of the uploaded file
+ */
 export async function upload(filePath: string, key: string): Promise<string> {
   if (MODE === 'local') {
     const outputDir = './outputs';
 
+    // Ensure output directory exists
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir);
     }
 
     const dest = path.join(outputDir, key);
+
+    // Ensure destination directory structure exists
     await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+
+    // Copy the file
     await fs.promises.copyFile(filePath, dest);
 
     console.log(`Saved locally: ${dest}`);
-
-    return dest; // RETURN PATH
+    return dest; // Return local path
   }
 
-  // TODO: Replace with real R2 upload
+  // Placeholder for real R2 upload
   const url = `https://your-r2-domain/${key}`;
-
   console.log(`Uploading ${filePath} to ${url}`);
 
-  return url; // RETURN URL
+  return url; // Return URL
 }

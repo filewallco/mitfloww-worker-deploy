@@ -4,8 +4,13 @@ import { enqueueFile } from './queue/enqueue';
 import { randomUUID } from 'crypto';
 import { FileJob } from './types';
 
+/** Directory containing test files for local development */
 const TEST_DIR = path.join(__dirname, '../test-files');
 
+/**
+ * Scan test-files folder and enqueue all supported video files.
+ * Supported formats: mp4, mov, avi, mkv
+ */
 async function run() {
   if (!fs.existsSync(TEST_DIR)) {
     console.error('test-files folder not found');
@@ -25,9 +30,10 @@ async function run() {
     const fullPath = path.join(TEST_DIR, file);
     const stats = fs.statSync(fullPath);
     const ext = path.extname(file).toLowerCase();
-    
+
+    // Skip non-video files
     if (!['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) {
-      console.log(`⏭ Skipping non-video: ${file}`);
+      console.log(`Skipping non-video: ${file}`);
       continue;
     }
 
@@ -41,7 +47,6 @@ async function run() {
     };
 
     console.log(`Enqueueing: ${file}`);
-
     await enqueueFile(job);
   }
 
