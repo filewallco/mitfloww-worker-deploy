@@ -1,4 +1,4 @@
-import { FileJob } from '../types';
+import { FileJob, JobStatus } from '../types';
 import { processVideo } from '../processors/video';
 import { download, upload } from '../utils/r2';
 import { acquire, release } from './admission';
@@ -6,10 +6,13 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { connection } from '../queue/connection';
+import { enqueueFile } from '../queue/enqueue';
 
 /**
- * Determine job type based on file size.
- * @param size - File size in bytes
+ * Determine the job category based on file size.
+ * - 'small'  : <50 MB
+ * - 'medium' : 50 MB – 500 MB
+ * - 'large'  : >500 MB
  */
 function getType(size: number): 'small' | 'medium' | 'large' {
   const MB = 1024 * 1024;
@@ -18,67 +21,80 @@ function getType(size: number): 'small' | 'medium' | 'large' {
   return 'large';
 }
 
-/**
- * Sleep for specified milliseconds.
- */
+/** Sleep helper (ms) */
 function sleep(ms: number) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
 /**
- * Store or update job metadata in Redis.
- * @param id - Job ID
- * @param data - Metadata object
+ * Centralized helper to update job metadata in Redis.
+ * Updates status, stage, and any extra info (like progress, errors, output).
+ * TTL of 24 hours is set to avoid stale data.
+ *
+ * @param jobId - Unique identifier of the job
+ * @param status - Current JobStatus
+ * @param stage - Current stage of processing
+ * @param extra - Optional additional metadata
  */
-async function setJobMeta(id: string, data: any) {
-  await connection.hset(`job:${id}`, data);
-  await connection.expire(`job:${id}`, 60 * 60 * 24); // 24h expiration
+async function updateJobStage(
+  jobId: string,
+  status: JobStatus,
+  stage: string,
+  extra?: Record<string, any>
+) {
+  await connection.hset(`job:${jobId}`, { status, stage, ...extra });
+  await connection.expire(`job:${jobId}`, 60 * 60 * 24); // 24h TTL
 }
 
 /**
- * Main handler for processing a file job.
- * Downloads, processes, uploads, and manages job state.
+ * Main job handler.
+ * Handles the lifecycle of a file job: downloading, processing, uploading,
+ * retrying on failure, and optionally moving to DLQ.
+ *
+ * @param job - FileJob object with metadata and file info
+ * @param bullJob - Optional BullMQ job reference (for progress & retries)
  */
 export async function handleJob(job: FileJob, bullJob?: any) {
   const startTime = Date.now();
   const type = getType(job.size);
 
-  // Attempt to acquire processing slot
+  // Step 0: Acquire a processing slot based on job type
   const acquired = await acquire(type);
-  if (!acquired) {
-    throw new Error('No capacity, retrying...');
-  }
+  if (!acquired) throw new Error('No capacity, retrying...');
 
+  // Temporary directories and paths
   const tempDir = path.join(os.tmpdir(), job.fileId);
   const inputPath = path.join(tempDir, 'input');
   const outputPath = path.join(tempDir, 'output.mp4');
 
-  await fs.promises.mkdir(tempDir, { recursive: true });
+  // Ensure directories exist
+  await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+
+  let jobStatus: JobStatus = 'processing';
 
   try {
-    await setJobMeta(job.fileId, {
-      status: 'processing',
-      stage: 'downloading',
-      startedAt: startTime,
-    });
-
+    /** Stage 1: Downloading the input file */
+    await updateJobStage(job.fileId, jobStatus, 'downloading', { startedAt: startTime });
     await download(job.inputUrl, inputPath);
 
+    /** Stage 2: Processing (only for video files) */
     if (job.fileType === 'video') {
-      await setJobMeta(job.fileId, { stage: 'processing' });
+      await updateJobStage(job.fileId, 'processing', 'processing');
 
-      await processVideo(inputPath, outputPath, async (p: number) => {
-        await setJobMeta(job.fileId, { stage: 'processing', progress: p });
-        bullJob?.updateProgress(p);
+      await processVideo(inputPath, outputPath, async (progress: number) => {
+        // Update progress both in Redis and BullMQ
+        await updateJobStage(job.fileId, 'processing', 'processing', { progress });
+        bullJob?.updateProgress(progress);
       });
     }
 
-    await setJobMeta(job.fileId, { stage: 'uploading' });
+    /** Stage 3: Uploading the processed file */
+    await updateJobStage(job.fileId, 'processing', 'uploading');
     const result = await upload(outputPath, job.outputKey);
 
-    await setJobMeta(job.fileId, {
-      status: 'completed',
-      stage: 'done',
+    /** Job successfully completed */
+    jobStatus = 'completed';
+    await updateJobStage(job.fileId, jobStatus, 'done', {
       completedAt: Date.now(),
       duration: Date.now() - startTime,
       output: result,
@@ -86,11 +102,12 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     });
 
   } catch (err: any) {
-    const isRetrying =
-      bullJob && bullJob.attemptsMade < (bullJob.opts.attempts || 1);
+    // Determine if the job can still be retried
+    const isRetrying = bullJob && bullJob.attemptsMade < (bullJob.opts.attempts || 1);
+    jobStatus = isRetrying ? 'retrying' : 'failed';
 
-    await setJobMeta(job.fileId, {
-      status: isRetrying ? 'retrying' : 'failed',
+    /** Update failed state in Redis */
+    await updateJobStage(job.fileId, jobStatus, 'failed', {
       error: err.message,
       failedAt: Date.now(),
       attemptsMade: bullJob?.attemptsMade || 0,
@@ -98,12 +115,28 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       success: false,
     });
 
+    /** Requeue logic or Dead Letter Queue (DLQ) */
+    if (!isRetrying) {
+      const shouldRequeue = job.size < 500 * 1024 * 1024; // Only small/medium files
+      if (shouldRequeue) {
+        console.log(`Requeueing job ${job.fileId}...`);
+        await enqueueFile(job); // Re-add job to the queue
+      } else {
+        console.log(`Moving job ${job.fileId} to DLQ`);
+        await connection.rpush('dead-letter-queue', JSON.stringify(job)); // Persistent DLQ
+      }
+    }
+
+    // Bubble up the error for BullMQ to handle retry/backoff
     throw err;
 
   } finally {
-    // Release the acquired slot
+    /** Release the acquired slot regardless of success/failure */
     await release(type);
-    // Clean temporary directory
-    await fs.promises.rm(tempDir, { recursive: true, force: true });
+
+    /** Clean temporary directory only if the job completed successfully */
+    if (jobStatus === 'completed') {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    }
   }
 }

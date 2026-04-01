@@ -1,5 +1,5 @@
 import { fileQueue } from './queues';
-import { FileJob } from '../types';
+import { ATTEMPTS, FileJob } from '../types';
 import { connection } from './connection';
 
 const MB = 1024 * 1024;
@@ -92,7 +92,7 @@ export async function enqueueFile(job: FileJob) {
   return fileQueue.add(sizeType, job, {
     jobId: job.fileId,
     priority: getPriority(job),
-    attempts: 5,
+    attempts: ATTEMPTS[sizeType],
     backoff: {
       type: 'exponential',
       delay: 5000,
