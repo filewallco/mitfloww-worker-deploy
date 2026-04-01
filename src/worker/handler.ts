@@ -21,11 +21,6 @@ function getType(size: number): 'small' | 'medium' | 'large' {
   return 'large';
 }
 
-/** Sleep helper (ms) */
-function sleep(ms: number) {
-  return new Promise((res) => setTimeout(res, ms));
-}
-
 /**
  * Centralized helper to update job metadata in Redis.
  * Updates status, stage, and any extra info (like progress, errors, output).
