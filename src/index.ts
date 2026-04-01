@@ -1,9 +1,9 @@
 import dotenv from 'dotenv';
 dotenv.config({ path: '.env.local' });
 
-import './worker/smallWorker';
-import './worker/mediumWorker';
-import './worker/largeWorker';
+import './worker/fastWorker';
+import './worker/standardWorker';
+import './worker/heavyWorker';
 
 const MODE = (process.env.MODE as 'local' | 'server') || 'local';
 

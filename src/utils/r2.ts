@@ -1,9 +1,9 @@
 import fs from 'fs';
 import https from 'https';
+import path from 'path';
 
 const MODE = process.env.MODE || 'local';
 
-// ALWAYS export download
 export async function download(url: string, dest: string) {
   if (MODE === 'local' && url.startsWith('file://')) {
     const localPath = url.replace('file://', '');
@@ -13,18 +13,30 @@ export async function download(url: string, dest: string) {
 
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
-    https.get(url, (res) => {
+
+    const req = https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}`));
+      }
+
       res.pipe(file);
+
       file.on('finish', () => {
         file.close();
         resolve(true);
       });
-    }).on('error', reject);
+    });
+
+    req.setTimeout(30000, () => {
+      req.destroy();
+      reject(new Error('Download timeout'));
+    });
+
+    req.on('error', reject);
   });
 }
 
-// ALWAYS export upload
-export async function upload(filePath: string, key: string) {
+export async function upload(filePath: string, key: string): Promise<string> {
   if (MODE === 'local') {
     const outputDir = './outputs';
 
@@ -32,15 +44,19 @@ export async function upload(filePath: string, key: string) {
       fs.mkdirSync(outputDir);
     }
 
-    const fileName = key.split('/').pop();
-    const dest = `${outputDir}/${fileName}`;
-
+    const dest = path.join(outputDir, key);
+    await fs.promises.mkdir(path.dirname(dest), { recursive: true });
     await fs.promises.copyFile(filePath, dest);
 
     console.log(`Saved locally: ${dest}`);
-    return;
+
+    return dest; // RETURN PATH
   }
 
-  // later replace with R2 SDK
-  console.log(`Uploading ${filePath} to ${key}`);
+  // TODO: Replace with real R2 upload
+  const url = `https://your-r2-domain/${key}`;
+
+  console.log(`Uploading ${filePath} to ${url}`);
+
+  return url; // RETURN URL
 }

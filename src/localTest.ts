@@ -37,6 +37,7 @@ async function run() {
       outputKey: `local/${file}`,
       fileType: 'video',
       size: stats.size,
+      userTier: 'free',
     };
 
     console.log(`Enqueueing: ${file}`);

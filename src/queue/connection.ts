@@ -1,7 +1,8 @@
 import IORedis from 'ioredis';
+import { config } from '../config';
 
 export const connection = new IORedis({
-  host: '127.0.0.1',
-  port: 6379,
+  host: config.redis.host,
+  port: config.redis.port,
   maxRetriesPerRequest: null,
 });

@@ -1,32 +1,51 @@
-import { execFile } from 'child_process';
+import { spawn } from 'child_process';
+import path from 'path';
 
-export function processVideo(input: string, output: string): Promise<void> {
+export function processVideo(
+  input: string,
+  output: string,
+  onProgress?: (progress: number) => void
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile(
-      'ffmpeg',
-      [
-        '-i', input,
-        '-i', 'assets/watermark.png',
+    const watermark = path.resolve(__dirname, '../../assets/watermark.png');
 
-        // scale + overlay watermark
-        '-filter_complex',
-        'scale=-2:360[video];[video][1]overlay=10:10',
+    const args = [
+      '-y',
+      '-i', input,
+      '-i', watermark,
+      '-filter_complex', 'scale=-2:360[video];[video][1]overlay=10:10',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '28',
+      '-c:a', 'aac',
+      '-progress', 'pipe:2',
+      
+      //Limit ffmpeg threads 
+      '-threads', '2',  
+      output,
+    ];
 
-        '-c:v', 'libx264',
-        '-crf', '28',
-        '-preset', 'fast',
+    const ffmpeg = spawn('ffmpeg', args);
 
-        '-c:a', 'copy',
+    ffmpeg.stderr.on('data', (data) => {
+      const str = data.toString();
 
-        output,
-      ],
-      (err, stdout, stderr) => {
-        if (err) {
-          console.error(stderr);
-          return reject(err);
-        }
-        resolve();
+      if (onProgress && str.includes('out_time_ms')) {
+        const time = Number(str.split('=')[1]);
+        onProgress(time);
       }
-    );
+    });
+
+    const timeout = setTimeout(() => {
+      ffmpeg.kill('SIGKILL');
+      reject(new Error('FFmpeg timeout'));
+    }, 10 * 60 * 1000);
+
+    ffmpeg.on('close', (code) => {
+      clearTimeout(timeout);
+
+      if (code !== 0) return reject(new Error('FFmpeg failed'));
+      resolve();
+    });
   });
 }

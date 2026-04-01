@@ -4,4 +4,6 @@ export interface FileJob {
   outputKey: string;
   fileType: 'video' | 'pdf' | 'zip' | 'other';
   size: number;
+
+  userTier: 'free' | 'premium' | 'vip';
 }
