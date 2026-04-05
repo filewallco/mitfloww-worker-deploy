@@ -95,7 +95,17 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   // Step 0: Acquire a processing slot based on job type
   const acquired = await acquire(type);
-  if (!acquired) throw new Error('No capacity, retrying...');
+  if (!acquired) {
+    await new Promise(r => setTimeout(r, 2000));
+
+    // REQUEUE instead of fail
+    await enqueueFile({
+      ...job,
+      retryCount: (job.retryCount || 0) + 1,
+    });
+
+    return;
+  }
 
   // Temporary directories and paths
   const tempDir = path.join(os.tmpdir(), job.fileId);

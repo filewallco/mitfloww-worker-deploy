@@ -50,7 +50,7 @@ function basePriority(job: FileJob): number {
  * - Lower number = higher priority in BullMQ
  * - Aging reduces priority value over time (boosts older jobs)
  */
-function getPriority(job: FileJob): number {
+async function getPriority(job: FileJob): Promise<number> {
   const base = basePriority(job);
 
   /**
@@ -60,7 +60,11 @@ function getPriority(job: FileJob): number {
    * - Every minute reduces priority slightly
    */
   const agingFactor = 0.1; // tuneable
-  const waitingMinutes = 0; // initial enqueue = 0
+  const createdAt = Number(
+    await connection.hget(`job:${job.fileId}`, 'createdAt')
+  );
+
+  const waitingMinutes = (Date.now() - createdAt) / 60000;
 
   return Math.floor(base - waitingMinutes * agingFactor);
 }
@@ -97,31 +101,35 @@ export async function enqueueFile(job: FileJob) {
    * Store initial metadata in Redis.
    * Redis becomes the single source of truth for UI.
    */
-  await connection.hset(`job:${job.fileId}`, {
-    sessionId,
-    status: 'queued',
-    stage: 'waiting',
-    createdAt: Date.now(),
+  try {
+    await connection.hset(`job:${job.fileId}`, {
+      sessionId,
+      status: 'queued',
+      stage: 'waiting',
+      createdAt: Date.now(),
 
-    inputUrl: job.inputUrl,
-    outputKey: job.outputKey,
-    fileType: job.fileType,
+      inputUrl: job.inputUrl,
+      outputKey: job.outputKey,
+      fileType: job.fileType,
 
-    size: job.size,
-    userTier: job.userTier,
-    progress: 0,
+      size: job.size,
+      userTier: job.userTier,
+      progress: 0,
 
-    /**
-     * NEW: track retries
-     */
-    retryCount,
-    queueName:
-      sizeType === 'small'
-        ? 'small-files'
-        : sizeType === 'medium'
-        ? 'medium-files'
-        : 'large-files',
-  });
+      /**
+       * NEW: track retries
+       */
+      retryCount,
+      queueName:
+        sizeType === 'small'
+          ? 'small-files'
+          : sizeType === 'medium'
+            ? 'medium-files'
+            : 'large-files',
+    });
+  } catch (e) {
+    console.error('REDIS WRITE FAILED', e);
+  }
 
   // Set a TTL of 24 hours for job metadata
   await connection.expire(`job:${job.fileId}`, 60 * 60 * 24);
@@ -140,7 +148,7 @@ export async function enqueueFile(job: FileJob) {
   return queue.add(sizeType, job, {
     jobId: `${job.fileId}-${Date.now()}`,
     originalId: job.fileId,
-    priority: getPriority(job),
+    priority: await getPriority(job),
     attempts: ATTEMPTS[sizeType],
     backoff: {
       type: 'exponential',

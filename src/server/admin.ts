@@ -6,10 +6,6 @@ import { connection } from '../queue/connection';
  * Separates LIVE jobs and HISTORY jobs.
  */
 export async function getSystemSnapshot() {
-  const smallJobs = await smallQueue.getJobs(['waiting','active','completed','failed','delayed']);
-  const mediumJobs = await mediumQueue.getJobs(['waiting','active','completed','failed','delayed']);
-  const largeJobs = await largeQueue.getJobs(['waiting','active','completed','failed','delayed']);
-
   const keys = (await connection.keys('job:*')).filter(
     k => !k.includes(':logs')
   );
@@ -27,7 +23,22 @@ export async function getSystemSnapshot() {
       queueName: meta.queueName || 'unknown',
     });
   }
+    
+  /**
+   * NEW: sort jobs by queuedAt (oldest first)
+   * This ensures deterministic ordering in UI
+   */
+  const jobsWithMeta = await Promise.all(
+    jobs.map(async (job) => {
+      const meta = await connection.hgetall(`job:${job.id}`);
+      return {
+        ...job,
+        queuedAt: meta.queuedAt ? Number(meta.queuedAt) : 0,
+      };
+    })
+  );
 
+  jobsWithMeta.sort((a, b) => a.queuedAt - b.queuedAt);
   const stats = {
     total: 0,
     waiting: 0,
@@ -47,7 +58,7 @@ export async function getSystemSnapshot() {
   const mediumWaiting = await mediumQueue.getJobs(['waiting']);
   const largeWaiting = await largeQueue.getJobs(['waiting']);
 
-  for (const job of jobs) {
+  for (const job of jobsWithMeta) {
     const meta = await connection.hgetall(`job:${job.id}`);
 
     const state = meta.status || 'unknown';
@@ -80,10 +91,8 @@ export async function getSystemSnapshot() {
 
     const elapsed = startedAt ? now - startedAt : null;
 
-    const eta =
-      progress > 1 && elapsed
-        ? (elapsed / progress) * (100 - progress)
-        : null;
+    const speed = elapsed ? progress / elapsed : 0;
+    const eta = speed > 0 ? (100 - progress) / speed : null;
 
     const avgProcessingTime = 30000; // start with 30s baseline
 

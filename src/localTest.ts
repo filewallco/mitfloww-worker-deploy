@@ -4,53 +4,77 @@ import { enqueueFile } from './queue/enqueue';
 import { randomUUID } from 'crypto';
 import { FileJob } from './types';
 
-/** Directory containing test files for local development */
 const TEST_DIR = path.join(__dirname, '../test-files');
 
 /**
- * Scan test-files folder and enqueue all supported video files.
- * Supported formats: mp4, mov, avi, mkv
+ * Track already processed files
  */
-async function run() {
-  if (!fs.existsSync(TEST_DIR)) {
-    console.error('test-files folder not found');
-    process.exit(1);
-  }
+const seen = new Set<string>();
 
-  const files = fs.readdirSync(TEST_DIR);
+/**
+ * Safe enqueue wrapper
+ */
+async function enqueueSafe(file: string) {
+  if (seen.has(file)) return;
 
-  if (files.length === 0) {
-    console.log('No files found in test-files/');
+  seen.add(file);
+
+  const fullPath = path.join(TEST_DIR, file);
+  const stats = fs.statSync(fullPath);
+  const ext = path.extname(file).toLowerCase();
+
+  if (!['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) {
+    console.log(`Skipping non-video: ${file}`);
     return;
   }
 
-  console.log(`Found ${files.length} files`);
+  const job: FileJob = {
+    fileId: randomUUID(),
+    inputUrl: `file://${fullPath}`,
+    outputKey: `local/${file}`,
+    fileType: 'video',
+    size: stats.size,
+    userTier: 'free',
+  };
+
+  console.log(`ENQUEUE CALLED: ${file}`);
+  await enqueueFile(job);
+}
+
+/**
+ * Initial scan (startup)
+ */
+async function initialScan() {
+  const files = fs.readdirSync(TEST_DIR);
+  console.log(`Initial scan: ${files.length} files`);
 
   for (const file of files) {
-    const fullPath = path.join(TEST_DIR, file);
-    const stats = fs.statSync(fullPath);
-    const ext = path.extname(file).toLowerCase();
-
-    // Skip non-video files
-    if (!['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) {
-      console.log(`Skipping non-video: ${file}`);
-      continue;
-    }
-
-    const job: FileJob = {
-      fileId: randomUUID(),
-      inputUrl: `file://${fullPath}`,
-      outputKey: `local/${file}`,
-      fileType: 'video',
-      size: stats.size,
-      userTier: 'free',
-    };
-
-    console.log(`Enqueueing: ${file}`);
-    await enqueueFile(job);
+    await enqueueSafe(file);
   }
+}
 
-  console.log('All jobs queued');
+/**
+ * NEW: Polling loop for new files
+ */
+function startPolling() {
+  setInterval(async () => {
+    const files = fs.readdirSync(TEST_DIR);
+
+    for (const file of files) {
+      if (!seen.has(file)) {
+        console.log('NEW FILE DETECTED:', file);
+        await enqueueSafe(file);
+      }
+    }
+  }, 3000); // every 3 seconds
+}
+
+/**
+ * Entry
+ */
+async function run() {
+  await initialScan();
+  startPolling();
 }
 
 run();
