@@ -395,3 +395,37 @@ Frontend should:
 * Advanced scheduling
 
 ---
+
+## To run the server
+
+***Start Docker***
+
+```bash
+docker run -d -p 6379:6379 --name filewall-redis redis
+docker stop filewall-redis
+docker start filewall-redis
+```
+
+***Run node server***
+
+```bash
+pnpm ts-node src/index.ts
+```
+
+---
+
+## Usefull docker commands
+
+***Verify docker running***
+
+```bash
+docker ps
+```
+
+***To remove container***
+
+```bash
+docker rm <container_id>
+```
+
+---

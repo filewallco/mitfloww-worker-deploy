@@ -3,13 +3,16 @@ import { connection } from '../queue/connection';
 import { handleJob } from './handler';
 
 /**
- * Worker for standard processing (all other jobs)
+ * Worker for MEDIUM files
  */
 new Worker(
-  'file-processing',
+  'medium-files',
   async (job) => {
     console.log('STANDARD worker:', job.id);
     await handleJob(job.data, job);
   },
-  { connection, concurrency: 3 }
+  {
+    connection,
+    concurrency: 3,
+  }
 );

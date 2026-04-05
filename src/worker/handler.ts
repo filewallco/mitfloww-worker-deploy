@@ -7,6 +7,7 @@ import fs from 'fs';
 import os from 'os';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
+import { getDuration } from '../processors/video';
 
 /**
  * Determine the job category based on file size.
@@ -37,8 +38,37 @@ async function updateJobStage(
   stage: string,
   extra?: Record<string, any>
 ) {
-  await connection.hset(`job:${jobId}`, { status, stage, ...extra });
-  await connection.expire(`job:${jobId}`, 60 * 60 * 24); // 24h TTL
+  const payload = {
+    status,
+    stage,
+    ...extra,
+    updatedAt: Date.now(),
+  };
+
+  /**
+   * Store metadata
+   */
+  await connection.hset(`job:${jobId}`, payload);
+
+  /**
+   * Append log entry (NEW)
+   * This allows UI timeline view
+   */
+  await connection.rpush(
+    `job:${jobId}:logs`,
+    JSON.stringify({
+      time: Date.now(),
+      stage,
+      status,
+      ...extra,
+    })
+  );
+
+  /**
+   * Keep logs for 24h
+   */
+  await connection.expire(`job:${jobId}`, 60 * 60 * 24);
+  await connection.expire(`job:${jobId}:logs`, 60 * 60 * 24);
 }
 
 /**
@@ -50,6 +80,16 @@ async function updateJobStage(
  * @param bullJob - Optional BullMQ job reference (for progress & retries)
  */
 export async function handleJob(job: FileJob, bullJob?: any) {
+  
+  /**
+   * NEW: explicitly mark job as queued/waiting
+   * This fixes empty stage + UI inconsistency
+   */
+  await updateJobStage(job.fileId, 'queued', 'waiting', {
+    createdAt: Date.now(),
+    queuedAt: Date.now(),
+  });
+
   const startTime = Date.now();
   const type = getType(job.size);
 
@@ -69,18 +109,34 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   try {
     /** Stage 1: Downloading the input file */
-    await updateJobStage(job.fileId, jobStatus, 'downloading', { startedAt: startTime });
+    await updateJobStage(job.fileId, jobStatus, 'downloading', {
+      startedAt: startTime,
+    });
     await download(job.inputUrl, inputPath);
 
     /** Stage 2: Processing (only for video files) */
     if (job.fileType === 'video') {
       await updateJobStage(job.fileId, 'processing', 'processing');
+    
+    const duration = getDuration(inputPath);
 
-      await processVideo(inputPath, outputPath, async (progress: number) => {
-        // Update progress both in Redis and BullMQ
-        await updateJobStage(job.fileId, 'processing', 'processing', { progress });
-        bullJob?.updateProgress(progress);
+    // normalize FFmpeg progress → percentage
+    await processVideo(inputPath, outputPath, async (timeMs: number) => {
+      /**
+       * WARNING:
+       * This is an approximation.
+       * Proper fix requires ffprobe duration (advanced).
+       */
+      const APPROX_DURATION = 5 * 60 * 1000; // 5 min fallback
+
+      const percent = Math.min((timeMs / duration) * 100, 100);
+
+      await updateJobStage(job.fileId, 'processing', 'processing', {
+        progress: percent, // now real %
       });
+
+      bullJob?.updateProgress(percent);
+    });
     }
 
     /** Stage 3: Uploading the processed file */
@@ -100,6 +156,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     // Determine if the job can still be retried
     const isRetrying = bullJob && bullJob.attemptsMade < (bullJob.opts.attempts || 1);
     jobStatus = isRetrying ? 'retrying' : 'failed';
+    const MAX_TOTAL_RETRIES = 5;
 
     /** Update failed state in Redis */
     await updateJobStage(job.fileId, jobStatus, 'failed', {
@@ -112,13 +169,20 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
     /** Requeue logic or Dead Letter Queue (DLQ) */
     if (!isRetrying) {
-      const shouldRequeue = job.size < 500 * 1024 * 1024; // Only small/medium files
-      if (shouldRequeue) {
-        console.log(`Requeueing job ${job.fileId}...`);
-        await enqueueFile(job); // Re-add job to the queue
+      const shouldRequeue = job.size < 500 * 1024 * 1024;
+
+      const totalRetries = job.retryCount || 0;
+
+      if (shouldRequeue && totalRetries < MAX_TOTAL_RETRIES) {
+        console.log(`Requeueing job ${job.fileId} (attempt ${totalRetries + 1})`);
+
+        await enqueueFile({
+          ...job,
+          retryCount: totalRetries + 1,
+        });
       } else {
         console.log(`Moving job ${job.fileId} to DLQ`);
-        await connection.rpush('dead-letter-queue', JSON.stringify(job)); // Persistent DLQ
+        await connection.rpush('dead-letter-queue', JSON.stringify(job));
       }
     }
 
@@ -126,12 +190,25 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     throw err;
 
   } finally {
-    /** Release the acquired slot regardless of success/failure */
     await release(type);
 
-    /** Clean temporary directory only if the job completed successfully */
+    /**
+     * Cleanup strategy:
+     * - Always clean on success
+     * - Keep failed temp for retry BUT limit retention
+     */
     if (jobStatus === 'completed') {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
+    } else {
+      /**
+       * Schedule delayed cleanup for failed jobs to allow for retries and debugging.
+       * Prevent disk explosion
+       */
+      setTimeout(async () => {
+        try {
+          await fs.promises.rm(tempDir, { recursive: true, force: true });
+        } catch { }
+      }, 1000 * 60 * 30); // 30 minutes retention
     }
   }
 }

@@ -19,6 +19,9 @@ export interface FileJob {
 
   /** Tier of the user uploading the file */
   userTier: 'free' | 'premium' | 'vip';
+
+  /** Total retry attempts across requeues */
+  retryCount?: number;
 }
 
 /**

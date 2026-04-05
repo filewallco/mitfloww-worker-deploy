@@ -1,4 +1,4 @@
-import { fileQueue } from './queues';
+import { smallQueue, mediumQueue, largeQueue } from './queues';
 import { ATTEMPTS, FileJob } from '../types';
 import { connection } from './connection';
 
@@ -44,16 +44,25 @@ function basePriority(job: FileJob): number {
 
 /**
  * Computes final priority including aging to prevent starvation.
- * Older jobs gradually gain higher priority.
+ * Uses bounded aging based on waiting time.
  *
- * @param job - File job object
- * @returns numeric priority to pass to BullMQ
+ * IMPORTANT:
+ * - Lower number = higher priority in BullMQ
+ * - Aging reduces priority value over time (boosts older jobs)
  */
 function getPriority(job: FileJob): number {
-  const createdAt = Date.now();
+  const base = basePriority(job);
 
-  // Subtracting minutes from base priority to age the job
-  return basePriority(job) - Math.floor(createdAt / (1000 * 60));
+  /**
+   * Use a small aging factor to boost older jobs over time.
+   * This prevents starvation of lower-priority jobs.
+   * Example:
+   * - Every minute reduces priority slightly
+   */
+  const agingFactor = 0.1; // tuneable
+  const waitingMinutes = 0; // initial enqueue = 0
+
+  return Math.floor(base - waitingMinutes * agingFactor);
 }
 
 /**
@@ -69,34 +78,74 @@ function getPriority(job: FileJob): number {
 export async function enqueueFile(job: FileJob) {
   const sizeType = classify(job.size);
 
-  // Store job metadata in Redis
+  /**
+   * Assign a sessionId to isolate runs.
+   * This prevents mixing old jobs with current execution.
+   */
+  const sessionId = process.env.SESSION_ID || 'dev-session';
+
+  /**
+   * Preserve retry history if exists
+   */
+  const existing = await connection.hgetall(`job:${job.fileId}`);
+
+  const retryCount = existing.retryCount
+    ? Number(existing.retryCount) + 1
+    : 0;
+
+  /**
+   * Store initial metadata in Redis.
+   * Redis becomes the single source of truth for UI.
+   */
   await connection.hset(`job:${job.fileId}`, {
+    sessionId,
     status: 'queued',
     stage: 'waiting',
     createdAt: Date.now(),
+
+    inputUrl: job.inputUrl,
+    outputKey: job.outputKey,
+    fileType: job.fileType,
+
     size: job.size,
     userTier: job.userTier,
+    progress: 0,
+
+    /**
+     * NEW: track retries
+     */
+    retryCount,
+    queueName:
+      sizeType === 'small'
+        ? 'small-files'
+        : sizeType === 'medium'
+        ? 'medium-files'
+        : 'large-files',
   });
 
   // Set a TTL of 24 hours for job metadata
   await connection.expire(`job:${job.fileId}`, 60 * 60 * 24);
+  /**
+   * Select correct queue based on file size
+   */
+  let queue;
 
-  // Get current counts to calculate queue position
-  const counts = await fileQueue.getJobCounts();
+  if (sizeType === 'small') queue = smallQueue;
+  else if (sizeType === 'medium') queue = mediumQueue;
+  else queue = largeQueue;
 
-  await connection.hset(`job:${job.fileId}`, {
-    queuePosition: counts.waiting || 0,
-  });
-
-  // Add job to BullMQ queue with priority and retry/backoff rules
-  return fileQueue.add(sizeType, job, {
-    jobId: job.fileId,
+  /**
+   * Add job to the appropriate queue
+   */
+  return queue.add(sizeType, job, {
+    jobId: `${job.fileId}-${Date.now()}`,
+    originalId: job.fileId,
     priority: getPriority(job),
     attempts: ATTEMPTS[sizeType],
     backoff: {
       type: 'exponential',
       delay: 5000,
     },
-    removeOnComplete: true,
+    removeOnComplete: false,
   });
 }

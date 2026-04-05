@@ -1,5 +1,6 @@
-import { spawn } from 'child_process';
+import { spawn, execSync  } from 'child_process';
 import path from 'path';
+import { config } from '../config';
 
 /**
  * Processes a video by scaling it to 360p and overlaying a watermark image.
@@ -50,7 +51,7 @@ export function processVideo(
     ];
 
     // Spawn FFmpeg process
-    const ffmpeg = spawn('ffmpeg', args);
+    const ffmpeg = spawn(config.ffmpegPath, args);
 
     /**
      * Listen for progress updates from FFmpeg
@@ -86,4 +87,12 @@ export function processVideo(
       resolve();
     });
   });
+}
+
+export function getDuration(file: string): number {
+  const out = execSync(
+    `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`
+  );
+
+  return parseFloat(out.toString()) * 1000;
 }

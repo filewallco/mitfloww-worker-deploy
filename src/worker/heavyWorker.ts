@@ -3,14 +3,16 @@ import { connection } from '../queue/connection';
 import { handleJob } from './handler';
 
 /**
- * Worker for heavy processing (large files)
+ * Worker for LARGE files (heavy processing)
  */
 new Worker(
-  'file-processing',
+  'large-files',
   async (job) => {
-    if (job.name !== 'large') return;
     console.log('HEAVY worker:', job.id);
     await handleJob(job.data, job);
   },
-  { connection, concurrency: 1 }
+  {
+    connection,
+    concurrency: 1, // heavy jobs → low concurrency
+  }
 );

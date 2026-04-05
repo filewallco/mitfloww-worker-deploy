@@ -3,14 +3,17 @@ import { connection } from '../queue/connection';
 import { handleJob } from './handler';
 
 /**
- * Worker for fast processing (small files)
+ * Worker for SMALL files (fast lane)
+ * Dedicated queue → no filtering needed
  */
 new Worker(
-  'file-processing',
+  'small-files',
   async (job) => {
-    if (job.name !== 'small') return;
     console.log('FAST worker:', job.id);
     await handleJob(job.data, job);
   },
-  { connection, concurrency: 2 }
+  {
+    connection,
+    concurrency: 5, // high concurrency for small files
+  }
 );
