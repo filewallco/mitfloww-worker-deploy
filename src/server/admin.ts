@@ -1,13 +1,14 @@
 import { smallQueue, mediumQueue, largeQueue } from '../queue/queues';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
+import { imageQueue } from '../queue/queues';
 
 /**
  * Returns structured system snapshot.
  * Separates LIVE jobs and HISTORY jobs.
  */
 export async function getSystemSnapshot() {
-  const keys = (await scanKeys('job:*')).filter(
+  const keys = (await scanKeys('job:[^:]*')).filter(
     k => !k.includes(':logs')
   );
 
@@ -73,6 +74,7 @@ export async function getSystemSnapshot() {
     let queueState = null;
 
     const jobInstance =
+      await imageQueue.getJob(job.id) ||
       await smallQueue.getJob(job.id) ||
       await mediumQueue.getJob(job.id) ||
       await largeQueue.getJob(job.id);
@@ -215,7 +217,9 @@ async function scanKeys(pattern: string): Promise<string[]> {
  * - no update for > X time
  */
 export async function recoverStuckJobs() {
-  const keys = await scanKeys('job:*');
+  const keys = (await scanKeys('job:[^:]*')).filter(
+    k => !k.includes(':logs')
+  );
 
   const now = Date.now();
   const STUCK_THRESHOLD = 5 * 60 * 1000; // 5 minutes
@@ -225,6 +229,7 @@ export async function recoverStuckJobs() {
     const jobId = key.replace('job:', '');
 
     const jobInstance =
+      await imageQueue.getJob(jobId) ||
       await smallQueue.getJob(jobId) ||
       await mediumQueue.getJob(jobId) ||
       await largeQueue.getJob(jobId);

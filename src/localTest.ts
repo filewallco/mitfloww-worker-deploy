@@ -3,6 +3,7 @@ import path from 'path';
 import { enqueueFile } from './queue/enqueue';
 import { randomUUID } from 'crypto';
 import { FileJob } from './types';
+import { fileTypeFromFile } from 'file-type';
 
 const TEST_DIR = path.join(__dirname, '../test-files');
 
@@ -21,18 +22,36 @@ async function enqueueSafe(file: string) {
 
   const fullPath = path.join(TEST_DIR, file);
   const stats = fs.statSync(fullPath);
-  const ext = path.extname(file).toLowerCase();
+  const detected = await fileTypeFromFile(fullPath);
 
-  if (!['.mp4', '.mov', '.avi', '.mkv'].includes(ext)) {
-    console.log(`Skipping non-video: ${file}`);
+  if (!detected) {
+    console.log(`Skipping unknown file: ${file}`);
     return;
   }
 
+  let fileType: FileJob['fileType'] = 'other';
+
+  if (detected.mime.startsWith('image/')) {
+    fileType = 'image';
+  } else if (detected.mime.startsWith('video/')) {
+    fileType = 'video';
+  } else {
+    console.log(`Unsupported file type: ${detected.mime}`);
+    return;
+  }
+
+  const extImage = path.extname(file);
+
+  const outputKey =
+    fileType === 'image'
+      ? `local/${path.parse(file).name}${extImage}`
+      : `local/${file}`;
+  
   const job: FileJob = {
     fileId: randomUUID(),
     inputUrl: `file://${fullPath}`,
-    outputKey: `local/${file}`,
-    fileType: 'video',
+    outputKey,
+    fileType,
     size: stats.size,
     userTier: 'free',
   };

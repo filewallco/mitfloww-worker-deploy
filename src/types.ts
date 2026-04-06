@@ -12,7 +12,7 @@ export interface FileJob {
   outputKey: string;
 
   /** Type of the file */
-  fileType: 'video' | 'pdf' | 'zip' | 'other';
+  fileType: 'video' |'image' | 'pdf' | 'zip' | 'other';
 
   /** Size of the file in bytes */
   size: number;

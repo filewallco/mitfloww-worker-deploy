@@ -10,6 +10,7 @@ import { enqueueFile } from '../queue/enqueue';
 import { getDuration } from '../processors/video';
 import { getFreeDiskSpace } from '../utils/disk';
 import { config } from '../config';
+import { processImage } from '../processors/image';
 
 const WORKER_ID = `${process.pid}-${Date.now()}`;
 const LOCK_TTL = 15 * 60 * 1000;
@@ -112,7 +113,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     console.log(`Skipping duplicate execution: ${job.fileId}`);
     return;
   }
-  
+
   /**
    * Ensure job has initial state without overwriting enqueue metadata
    */
@@ -139,7 +140,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       console.error('Heartbeat error:', err);
     }
   }, 60_000);
-  
+
   const type = getType(job.size);
 
   // Uncomment this for admission to handle slot allocation.
@@ -168,10 +169,12 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   // Temporary directories and paths
   const tempDir = path.join(os.tmpdir(), job.fileId);
   const inputPath = path.join(tempDir, 'input');
-  const outputPath = path.join(tempDir, 'output.mp4');
+  const outputBase = path.join(tempDir, 'output');
+
+  let outputPath = '';
 
   // Ensure directories exist
-  await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+  await fs.promises.mkdir(tempDir, { recursive: true });
 
   let jobStatus: JobStatus = 'processing';
 
@@ -196,36 +199,44 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
     await download(job.inputUrl, inputPath);
 
-    /** Stage 2: Processing (only for video files) */
-    if (job.fileType === 'video') {
-      await updateJobStage(job.fileId, 'processing', 'processing');
-    
-    let duration = 0;
-    try {
-      duration = getDuration(inputPath);
-    } catch {
-      duration = 5 * 60 * 1000; // fallback
+    /** Stage 2: Processing */
+    await updateJobStage(job.fileId, 'processing', 'processing');
+
+    if (job.fileType === 'image') {
+      const result = await processImage(inputPath, outputBase);
+      outputPath = result.outputPath;
+
+      job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
     }
 
-    const timeoutMs = Math.max(duration * 2.5, 15 * 60 * 1000);
-
-    // normalize FFmpeg progress → percentage
-    await processVideo(inputPath, outputPath, async (timeMs: number) => {
-      /**
-       * WARNING:
-       * This is an approximation.
-       * Proper fix requires ffprobe duration (advanced).
-       */
-
-      const percent = Math.min((timeMs / duration) * 100, 100);
-
+    if (job.fileType === 'image') {
       await updateJobStage(job.fileId, 'processing', 'processing', {
-        progress: percent,
+        progress: 100,
         bullJob,
       });
+    }
+    else if (job.fileType === 'video') {
+      let duration = 0;
+      try {
+        duration = getDuration(inputPath);
+      } catch {
+        duration = 5 * 60 * 1000;
+      }
 
-      bullJob?.updateProgress(percent);
-    });
+      if (job.fileType === 'video') {
+        outputPath = path.join(tempDir, 'output.mp4');
+      }
+
+      await processVideo(inputPath, outputPath, async (timeMs: number) => {
+        const percent = Math.min((timeMs / duration) * 100, 100);
+
+        await updateJobStage(job.fileId, 'processing', 'processing', {
+          progress: percent,
+          bullJob,
+        });
+
+        bullJob?.updateProgress(percent);
+      });
     }
 
     /** Stage 3: Uploading the processed file */

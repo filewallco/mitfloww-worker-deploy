@@ -12,6 +12,7 @@ import { cleanupTempDir } from './utils/cleanup';
 import './worker/fastWorker';
 import './worker/standardWorker';
 import './worker/heavyWorker';
+import './worker/imageWorker';
 
 process.env.SESSION_ID = Date.now().toString();
 const MODE = (process.env.MODE as 'local' | 'server') || 'local';

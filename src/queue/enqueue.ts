@@ -1,4 +1,4 @@
-import { smallQueue, mediumQueue, largeQueue } from './queues';
+import { smallQueue, mediumQueue, largeQueue, imageQueue } from './queues';
 import { ATTEMPTS, FileJob } from '../types';
 import { connection } from './connection';
 
@@ -25,6 +25,7 @@ function classify(size: number): 'small' | 'medium' | 'large' {
  * @returns numeric base priority
  */
 function basePriority(job: FileJob): number {
+  if (job.fileType === 'image') return -10;
   const sizeType = classify(job.size);
 
   const tierWeight = {
@@ -138,9 +139,13 @@ export async function enqueueFile(job: FileJob) {
    */
   let queue;
 
-  if (sizeType === 'small') queue = smallQueue;
-  else if (sizeType === 'medium') queue = mediumQueue;
-  else queue = largeQueue;
+  if (job.fileType === 'image') {
+    queue = imageQueue;
+  } else {
+    if (sizeType === 'small') queue = smallQueue;
+    else if (sizeType === 'medium') queue = mediumQueue;
+    else queue = largeQueue;
+  }
 
   /**
    * Add job to the appropriate queue

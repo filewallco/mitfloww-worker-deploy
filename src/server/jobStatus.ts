@@ -1,4 +1,4 @@
-import { smallQueue, mediumQueue, largeQueue } from '../queue/queues';
+import { smallQueue, mediumQueue, largeQueue, imageQueue } from '../queue/queues';
 import { connection } from '../queue/connection';
 
 /**
@@ -14,7 +14,7 @@ import { connection } from '../queue/connection';
  */
 export async function getJobStatus(id: string) {
   // Attempt to fetch the job from BullMQ
-  const job = await smallQueue.getJob(id) || await mediumQueue.getJob(id) || await largeQueue.getJob(id);
+  const job = await imageQueue.getJob(id) || await smallQueue.getJob(id) || await mediumQueue.getJob(id) || await largeQueue.getJob(id);
 
   // Retrieve job metadata from Redis
   const redisMeta = await connection.hgetall(`job:${id}`);

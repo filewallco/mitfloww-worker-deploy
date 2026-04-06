@@ -14,6 +14,7 @@
     "bullmq": "^5.71.1",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
+    "file-type": "^22.0.0",
     "ioredis": "^5.10.1",
     "multer": "^2.1.1",
     "ws": "^8.20.0"
@@ -21,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^25.5.0",
     "@types/ws": "^8.18.1",
+    "sharp": "^0.34.5",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.2"
   }
