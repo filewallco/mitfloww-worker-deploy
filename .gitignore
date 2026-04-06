@@ -58,3 +58,9 @@ temp/
 # -----------------------------
 test-files/
 outputs/
+
+# -----------------------------
+# Custom generated files
+# -----------------------------
+combine-src.js
+combined.txt
