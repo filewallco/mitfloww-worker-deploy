@@ -1,15 +1,23 @@
-import { spawn, execSync  } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import path from 'path';
 import { config } from '../config';
 
 /**
- * Processes a video by scaling it to 360p and overlaying a watermark image.
- * Uses FFmpeg via a child process.
- * 
- * @param input - Path to the input video file
- * @param output - Path where the processed video will be saved
- * @param onProgress - Optional callback to report progress in milliseconds
- * @returns A promise that resolves when processing is complete or rejects on error
+ * Executes FFmpeg to process a video:
+ * - Scales to 360p (maintaining aspect ratio)
+ * - Applies watermark overlay
+ * - Encodes using H.264 (libx264)
+ *
+ * Design goals:
+ * - Non-blocking (child process)
+ * - Observable (progress reporting)
+ * - Fault-tolerant (stall + max runtime protection)
+ *
+ * @param input Absolute path to input video file
+ * @param output Absolute path for processed output file
+ * @param onProgress Optional callback receiving processed timestamp (ms)
+ *
+ * @returns Promise<void> resolved on success, rejected on failure
  */
 export function processVideo(
   input: string,
@@ -17,24 +25,14 @@ export function processVideo(
   onProgress?: (progress: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    // Resolve watermark path relative to current file
+
+    /** Absolute path to watermark asset */
     const watermark = path.resolve(__dirname, '../../assets/watermark.png');
 
     /**
-     * FFmpeg command arguments
-     * -y : overwrite output file if exists
-     * -i input : input video file
-     * -i watermark : watermark image to overlay
-     * -filter_complex : video filters applied:
-     *      scale=-2:360 -> scale video height to 360px, width auto-adjusted to maintain aspect ratio
-     *      overlay=10:10 -> overlay watermark at 10px from top-left corner
-     * -c:v libx264 : encode video using H.264
-     * -preset fast : faster encoding speed
-     * -crf 28 : quality/compression ratio (higher = lower quality)
-     * -c:a aac : encode audio using AAC
-     * -progress pipe:2 : report progress on stderr
-     * -threads 2 : limit number of CPU threads FFmpeg uses
-     * output : path to save final processed video
+     * FFmpeg arguments:
+     * - progress pipe used for real-time progress tracking
+     * - single-threaded to allow controlled concurrency at system level
      */
     const args = [
       '-y',
@@ -50,45 +48,128 @@ export function processVideo(
       output,
     ];
 
-    // Spawn FFmpeg process
+    /** Spawn FFmpeg child process */
     const ffmpeg = spawn(config.ffmpegPath, args);
 
+    /** Timestamp of last progress update (used for stall detection) */
+    let lastProgressTime = Date.now();
+
+    /** Buffer for handling partial stderr chunks (line-safe parsing) */
+    let buffer = '';
+
+    /** Prevent multiple resolve/reject calls */
+    let finished = false;
+
     /**
-     * Listen for progress updates from FFmpeg
-     * FFmpeg outputs progress info to stderr with 'out_time_ms'
-     * Convert time to number and call onProgress callback
+     * Cleanup all timers to avoid leaks and ghost executions
+     */
+    function cleanup() {
+      clearInterval(stallCheck);
+      clearTimeout(hardTimeout);
+    }
+
+    /**
+     * Safe reject wrapper (idempotent)
+     */
+    function safeReject(err: Error) {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(err);
+    }
+
+    /**
+     * Safe resolve wrapper (idempotent)
+     */
+    function safeResolve() {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve();
+    }
+
+    /**
+     * STDERR parsing:
+     * FFmpeg emits key=value pairs, but in chunked form.
+     * We buffer and process line-by-line to avoid partial parsing bugs.
      */
     ffmpeg.stderr.on('data', (data) => {
-      const str = data.toString();
+      buffer += data.toString();
 
-      if (onProgress && str.includes('out_time_ms')) {
-        const time = Number(str.split('=')[1]);
-        onProgress(time);
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (line.startsWith('out_time_ms=')) {
+          lastProgressTime = Date.now();
+
+          if (onProgress) {
+            const value = Number(line.split('=')[1]);
+            if (!isNaN(value)) {
+              onProgress(value);
+            }
+          }
+        }
       }
     });
 
     /**
-     * Set a timeout for the FFmpeg process
-     * If processing exceeds 10 minutes, kill the process and reject
+     * Stall detection:
+     * If no progress is observed for a defined window,
+     * assume FFmpeg is stuck (bad input / codec / deadlock)
      */
-    const timeout = setTimeout(() => {
-      ffmpeg.kill('SIGKILL');
-      reject(new Error('FFmpeg timeout'));
-    }, 10 * 60 * 1000); // 10 minutes
+    const stallCheck = setInterval(() => {
+      const STALL_LIMIT = 5 * 60 * 1000; // 5 minutes
+
+      if (Date.now() - lastProgressTime > STALL_LIMIT) {
+        ffmpeg.kill('SIGKILL');
+        safeReject(new Error('FFmpeg stalled'));
+      }
+    }, 60_000);
 
     /**
-     * Handle FFmpeg process exit
-     * Clear timeout and resolve/reject promise based on exit code
+     * Hard runtime limit:
+     * Safety net for cases where FFmpeg keeps running without emitting progress
+     * (e.g., corrupted streams, edge codecs)
+     */
+    const MAX_RUNTIME = 6 * 60 * 60 * 1000; // 6 hours
+
+    const hardTimeout = setTimeout(() => {
+      ffmpeg.kill('SIGKILL');
+      safeReject(new Error('FFmpeg max runtime exceeded'));
+    }, MAX_RUNTIME);
+
+    /**
+     * Process exit handler
      */
     ffmpeg.on('close', (code) => {
-      clearTimeout(timeout);
+      if (code === 0) {
+        safeResolve();
+      } else {
+        safeReject(new Error(`FFmpeg failed with code ${code}`));
+      }
+    });
 
-      if (code !== 0) return reject(new Error('FFmpeg failed'));
-      resolve();
+    /**
+     * Spawn-level failure (binary missing, permission issues, etc.)
+     */
+    ffmpeg.on('error', (err) => {
+      safeReject(err);
     });
   });
 }
 
+/**
+ * Extracts video duration using ffprobe.
+ *
+ * Notes:
+ * - Returns duration in milliseconds
+ * - Used for progress normalization in higher-level logic
+ * - Blocking call (acceptable due to short execution time)
+ *
+ * @param file Absolute file path
+ * @returns Duration in milliseconds
+ */
 export function getDuration(file: string): number {
   const out = execSync(
     `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`

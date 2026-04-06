@@ -45,6 +45,12 @@ export const config = {
     max: Number(validateEnv('RATE_LIMIT_MAX', process.env.RATE_LIMIT_MAX || 10)),
     duration: Number(validateEnv('RATE_LIMIT_DURATION', process.env.RATE_LIMIT_DURATION || 1000)), // in ms
   },
+
+  /** Disk safety thresholds */
+  disk: {
+    minFreeBytes: Number(process.env.MIN_FREE_DISK || 5 * 1024 * 1024 * 1024), // 5GB
+    targetFreeBytes: Number(process.env.TARGET_FREE_DISK || 10 * 1024 * 1024 * 1024), // 10GB
+  },
 };
 
 // Ensure temp/output directories exist

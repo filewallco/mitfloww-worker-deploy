@@ -8,6 +8,8 @@ import os from 'os';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
 import { getDuration } from '../processors/video';
+import { getFreeDiskSpace } from '../utils/disk';
+import { config } from '../config';
 
 const WORKER_ID = `${process.pid}-${Date.now()}`;
 const LOCK_TTL = 15 * 60 * 1000;
@@ -179,6 +181,19 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       startedAt: startTime,
       bullJob,
     });
+
+    const free = getFreeDiskSpace();
+
+    if (free < config.disk.minFreeBytes) {
+      throw new Error(`Insufficient disk space: ${Math.round(free / 1e9)} GB left`);
+    }
+
+    const REQUIRED = job.size * 2; // input + output + buffer
+
+    if (free < REQUIRED) {
+      throw new Error('Not enough disk for this job');
+    }
+
     await download(job.inputUrl, inputPath);
 
     /** Stage 2: Processing (only for video files) */
@@ -191,6 +206,8 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     } catch {
       duration = 5 * 60 * 1000; // fallback
     }
+
+    const timeoutMs = Math.max(duration * 2.5, 15 * 60 * 1000);
 
     // normalize FFmpeg progress → percentage
     await processVideo(inputPath, outputPath, async (timeMs: number) => {
