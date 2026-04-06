@@ -11,6 +11,7 @@ import { getDuration } from '../processors/video';
 import { getFreeDiskSpace } from '../utils/disk';
 import { config } from '../config';
 import { processImage } from '../processors/image';
+import { spawn } from 'child_process';
 
 const WORKER_ID = `${process.pid}-${Date.now()}`;
 const LOCK_TTL = 15 * 60 * 1000;
@@ -216,32 +217,84 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       });
     }
     else if (job.fileType === 'video') {
-      let duration = 0;
-      try {
-        duration = getDuration(inputPath);
-      } catch {
-        duration = 5 * 60 * 1000;
-      }
+      const duration = getDuration(inputPath) || 5 * 60 * 1000;
 
       if (job.fileType === 'video') {
         outputPath = path.join(tempDir, 'output.mp4');
       }
 
-      await processVideo(inputPath, outputPath, async (timeMs: number) => {
-        const percent = Math.min((timeMs / duration) * 100, 100);
+      /**
+       * HLS streaming generation.
+       *
+       * Instead of splitting into manual parts,
+       * FFmpeg generates:
+       * - .m3u8 playlist
+       * - multiple .ts segments
+       *
+       * This enables seamless playback in frontend.
+       */
+      const hlsDir = path.join(tempDir, 'hls');
+      await fs.promises.mkdir(hlsDir, { recursive: true });
 
-        await updateJobStage(job.fileId, 'processing', 'processing', {
-          progress: percent,
-          bullJob,
+      const hlsOutput = path.join(hlsDir, 'index.m3u8');
+
+      await new Promise((resolve, reject) => {
+        const ffmpeg = spawn(config.ffmpegPath, [
+          '-i', inputPath,
+
+          '-vf', 'scale=-2:360',
+          '-c:v', 'libx264',
+          '-c:a', 'aac',
+
+          '-hls_time', '6',
+          '-hls_list_size', '0',
+          '-start_number', '0',
+
+          '-f', 'hls',
+          hlsOutput,
+        ]);
+
+        ffmpeg.on('close', (code) => {
+          if (code === 0) resolve(null);
+          else reject(new Error('HLS generation failed'));
         });
 
-        bullJob?.updateProgress(percent);
+        ffmpeg.on('error', reject);
       });
+
+      /**
+       * Upload all HLS files
+       */
+      const files = await fs.promises.readdir(hlsDir);
+
+      for (const file of files) {
+        const full = path.join(hlsDir, file);
+        const key = `${job.outputKey}/hls/${file}`;
+
+        await upload(full, key);
+      }
+
+      /**
+       * Store playlist reference
+       */
+      await connection.set(
+        `preview:${job.fileId}`,
+        `${job.outputKey}/hls/index.m3u8`
+      );
+
+      /**
+       * Final output (optional)
+       */
+      outputPath = hlsOutput;
     }
 
     /** Stage 3: Uploading the processed file */
     await updateJobStage(job.fileId, 'processing', 'uploading');
-    const result = await upload(outputPath, job.outputKey);
+    let result = "";
+    // For video, HLS already uploaded → skip final upload
+    if (job.fileType !== 'video') {
+      await upload(outputPath, job.outputKey);
+    }
 
     /** Job successfully completed */
     jobStatus = 'completed';

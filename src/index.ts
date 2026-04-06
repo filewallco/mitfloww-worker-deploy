@@ -33,6 +33,8 @@ console.log(`Running in ${MODE} mode`);
 startAdminServer();
 startWS();
 
+console.log("ACTUAL MODE:", process.env.MODE);
+
 setInterval(() => {
   recoverStuckJobs().catch(console.error);
 }, 60000); // every 1 min

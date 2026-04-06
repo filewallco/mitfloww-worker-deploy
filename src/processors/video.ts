@@ -22,22 +22,29 @@ import { config } from '../config';
 export function processVideo(
   input: string,
   output: string,
+  options?: {
+    start?: number;
+    duration?: number;
+    totalDuration?: number; // FULL video duration (important)
+    progressOffset?: number; // where this chunk starts in %
+    progressScale?: number;  // how much % this chunk contributes
+  },
   onProgress?: (progress: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-
-    /** Absolute path to watermark asset */
     const watermark = path.resolve(__dirname, '../../assets/watermark.png');
 
-    /**
-     * FFmpeg arguments:
-     * - progress pipe used for real-time progress tracking
-     * - single-threaded to allow controlled concurrency at system level
-     */
     const args = [
       '-y',
+
+      // FAST SEEK (important for large videos)
+      ...(options?.start ? ['-ss', String(options.start)] : []),
+
       '-i', input,
       '-i', watermark,
+
+      ...(options?.duration ? ['-t', String(options.duration)] : []),
+
       '-filter_complex', 'scale=-2:360[video];[video][1]overlay=10:10',
       '-c:v', 'libx264',
       '-preset', 'fast',
@@ -48,29 +55,17 @@ export function processVideo(
       output,
     ];
 
-    /** Spawn FFmpeg child process */
     const ffmpeg = spawn(config.ffmpegPath, args);
 
-    /** Timestamp of last progress update (used for stall detection) */
     let lastProgressTime = Date.now();
-
-    /** Buffer for handling partial stderr chunks (line-safe parsing) */
     let buffer = '';
-
-    /** Prevent multiple resolve/reject calls */
     let finished = false;
 
-    /**
-     * Cleanup all timers to avoid leaks and ghost executions
-     */
     function cleanup() {
       clearInterval(stallCheck);
       clearTimeout(hardTimeout);
     }
 
-    /**
-     * Safe reject wrapper (idempotent)
-     */
     function safeReject(err: Error) {
       if (finished) return;
       finished = true;
@@ -78,9 +73,6 @@ export function processVideo(
       reject(err);
     }
 
-    /**
-     * Safe resolve wrapper (idempotent)
-     */
     function safeResolve() {
       if (finished) return;
       finished = true;
@@ -88,11 +80,6 @@ export function processVideo(
       resolve();
     }
 
-    /**
-     * STDERR parsing:
-     * FFmpeg emits key=value pairs, but in chunked form.
-     * We buffer and process line-by-line to avoid partial parsing bugs.
-     */
     ffmpeg.stderr.on('data', (data) => {
       buffer += data.toString();
 
@@ -105,21 +92,31 @@ export function processVideo(
 
           if (onProgress) {
             const value = Number(line.split('=')[1]);
+
             if (!isNaN(value)) {
-              onProgress(value);
+              if (options?.totalDuration) {
+                // progressive mode
+                const chunkProgress =
+                  value / (options.duration ? options.duration * 1000 : options.totalDuration);
+
+                const scaled =
+                  (options.progressOffset || 0) +
+                  chunkProgress * (options.progressScale || 100);
+
+                onProgress(Math.min(scaled, 100));
+              } else {
+                // fallback (old behavior)
+                onProgress(value);
+              }
             }
           }
         }
       }
     });
 
-    /**
-     * Stall detection:
-     * If no progress is observed for a defined window,
-     * assume FFmpeg is stuck (bad input / codec / deadlock)
-     */
+    // STALL DETECTION
     const stallCheck = setInterval(() => {
-      const STALL_LIMIT = 5 * 60 * 1000; // 5 minutes
+      const STALL_LIMIT = 5 * 60 * 1000;
 
       if (Date.now() - lastProgressTime > STALL_LIMIT) {
         ffmpeg.kill('SIGKILL');
@@ -127,35 +124,20 @@ export function processVideo(
       }
     }, 60_000);
 
-    /**
-     * Hard runtime limit:
-     * Safety net for cases where FFmpeg keeps running without emitting progress
-     * (e.g., corrupted streams, edge codecs)
-     */
-    const MAX_RUNTIME = 6 * 60 * 60 * 1000; // 6 hours
+    // HARD TIMEOUT
+    const MAX_RUNTIME = 6 * 60 * 60 * 1000;
 
     const hardTimeout = setTimeout(() => {
       ffmpeg.kill('SIGKILL');
       safeReject(new Error('FFmpeg max runtime exceeded'));
     }, MAX_RUNTIME);
 
-    /**
-     * Process exit handler
-     */
     ffmpeg.on('close', (code) => {
-      if (code === 0) {
-        safeResolve();
-      } else {
-        safeReject(new Error(`FFmpeg failed with code ${code}`));
-      }
+      if (code === 0) safeResolve();
+      else safeReject(new Error(`FFmpeg failed with code ${code}`));
     });
 
-    /**
-     * Spawn-level failure (binary missing, permission issues, etc.)
-     */
-    ffmpeg.on('error', (err) => {
-      safeReject(err);
-    });
+    ffmpeg.on('error', safeReject);
   });
 }
 
