@@ -10,7 +10,7 @@ const MB = 1024 * 1024;
  * @returns 'small' | 'medium' | 'large'
  */
 function classify(size: number): 'small' | 'medium' | 'large' {
-  if (size < 50 * MB) return 'small';
+  if (size < 100 * MB) return 'small';
   if (size < 500 * MB) return 'medium';
   return 'large';
 }

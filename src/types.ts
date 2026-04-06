@@ -30,8 +30,8 @@ export interface FileJob {
  * while larger files get fewer retries to avoid long-running failed jobs blocking the queue.
  */
 export const ATTEMPTS = {
-  small: 3,   // Small files (<50MB) can be retried up to 3 times
-  medium: 2,  // Medium files (50MB–500MB) can be retried up to 2 times
+  small: 3,   // Small files (<100MB) can be retried up to 3 times
+  medium: 2,  // Medium files (100MB–500MB) can be retried up to 2 times
   large: 1,   // Large files (>500MB) are retried only once
 };
 

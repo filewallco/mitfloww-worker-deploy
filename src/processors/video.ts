@@ -46,7 +46,7 @@ export function processVideo(
       '-crf', '28',
       '-c:a', 'aac',
       '-progress', 'pipe:2',
-      '-threads', '2',
+      '-threads', '1',
       output,
     ];
 

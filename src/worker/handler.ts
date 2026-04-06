@@ -1,7 +1,7 @@
 import { FileJob, JobStatus } from '../types';
 import { processVideo } from '../processors/video';
 import { download, upload } from '../utils/r2';
-import { acquire, release } from './admission';
+// import { acquire, release } from './admission';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -14,13 +14,13 @@ const LOCK_TTL = 15 * 60 * 1000;
 
 /**
  * Determine the job category based on file size.
- * - 'small'  : <50 MB
- * - 'medium' : 50 MB – 500 MB
+ * - 'small'  : <100 MB
+ * - 'medium' : 100 MB – 500 MB
  * - 'large'  : >500 MB
  */
 function getType(size: number): 'small' | 'medium' | 'large' {
   const MB = 1024 * 1024;
-  if (size < 50 * MB) return 'small';
+  if (size < 100 * MB) return 'small';
   if (size < 500 * MB) return 'medium';
   return 'large';
 }
@@ -140,27 +140,28 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   
   const type = getType(job.size);
 
-  // Step 0: Acquire a processing slot based on job type
-  const acquired = await acquire(type);
-  if (!acquired) {
-    const retries = job.retryCount || 0;
+  // Uncomment this for admission to handle slot allocation.
+  // // Step 0: Acquire a processing slot based on job type
+  // const acquired = await acquire(type);
+  // if (!acquired) {
+  //   const retries = job.retryCount || 0;
 
-    if (retries > 3) {
-      await updateJobStage(job.fileId, 'failed', 'admission_failed', {
-        error: 'Admission limit exceeded',
-      });
-      return;
-    }
+  //   if (retries > 3) {
+  //     await updateJobStage(job.fileId, 'failed', 'admission_failed', {
+  //       error: 'Admission limit exceeded',
+  //     });
+  //     return;
+  //   }
 
-    await new Promise(r => setTimeout(r, 2000));
+  //   await new Promise(r => setTimeout(r, 2000));
 
-    await enqueueFile({
-      ...job,
-      retryCount: retries + 1,
-    });
+  //   await enqueueFile({
+  //     ...job,
+  //     retryCount: retries + 1,
+  //   });
 
-    return;
-  }
+  //   return;
+  // }
 
   // Temporary directories and paths
   const tempDir = path.join(os.tmpdir(), job.fileId);
@@ -291,7 +292,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     throw err;
 
   } finally {
-    await release(type);
+    // await release(type); // admission release code
 
     /**
      * Cleanup strategy:
