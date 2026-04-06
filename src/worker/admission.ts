@@ -19,9 +19,16 @@ function key(type: keyof typeof LIMITS) {
 }
 
 // LUA script for atomic slot acquisition in Redis
+// NOTE: Removed TTL to avoid concurrency leakage during long jobs
 const acquireScript = `
 local current = redis.call("GET", KEYS[1])
-if not current then current = 0 else current = tonumber(current) end
+if not current then
+  redis.call("SET", KEYS[1], 1)
+  return 1
+end
+
+current = tonumber(current)
+
 if current < tonumber(ARGV[1]) then
   redis.call("INCR", KEYS[1])
   return 1
@@ -49,7 +56,11 @@ export async function release(type: keyof typeof LIMITS) {
     `
     local val = redis.call("GET", KEYS[1])
     if val and tonumber(val) > 0 then
-      return redis.call("DECR", KEYS[1])
+      local val = redis.call("DECR", KEYS[1])
+      if val <= 0 then
+        redis.call("DEL", KEYS[1])
+      end
+      return val
     end
     return 0
     `,

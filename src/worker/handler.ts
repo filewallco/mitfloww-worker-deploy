@@ -9,6 +9,9 @@ import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
 import { getDuration } from '../processors/video';
 
+const WORKER_ID = `${process.pid}-${Date.now()}`;
+const LOCK_TTL = 15 * 60 * 1000;
+
 /**
  * Determine the job category based on file size.
  * - 'small'  : <50 MB
@@ -38,6 +41,14 @@ async function updateJobStage(
   stage: string,
   extra?: Record<string, any>
 ) {
+  // Extract bullJob
+  const { bullJob, ...safeExtra } = extra || {};
+
+  // Sync BullMQ progress
+  if (safeExtra?.progress !== undefined && bullJob) {
+    await bullJob.updateProgress(safeExtra.progress);
+  }
+
   const payload = {
     status,
     stage,
@@ -80,28 +91,72 @@ async function updateJobStage(
  * @param bullJob - Optional BullMQ job reference (for progress & retries)
  */
 export async function handleJob(job: FileJob, bullJob?: any) {
+
+  /**
+   * IDEMPOTENCY LOCK (CRITICAL)
+   * Prevent duplicate execution
+   */
+  const lockKey = `lock:${job.fileId}`;
+
+  const acquiredLock = await connection.set(
+    lockKey,
+    WORKER_ID,
+    'PX',
+    LOCK_TTL,
+    'NX'
+  );
+
+  if (acquiredLock !== 'OK') {
+    console.log(`Skipping duplicate execution: ${job.fileId}`);
+    return;
+  }
   
   /**
-   * NEW: explicitly mark job as queued/waiting
-   * This fixes empty stage + UI inconsistency
+   * Ensure job has initial state without overwriting enqueue metadata
    */
-  await updateJobStage(job.fileId, 'queued', 'waiting', {
-    createdAt: Date.now(),
-    queuedAt: Date.now(),
+  await connection.hset(`job:${job.fileId}`, {
+    status: 'processing',
+    stage: 'starting',
+    startedAt: Date.now(),
   });
 
   const startTime = Date.now();
+
+  // HEARTBEAT
+  const heartbeat = setInterval(async () => {
+    try {
+      const owner = await connection.get(lockKey);
+
+      if (owner === WORKER_ID) {
+        await connection.pexpire(lockKey, LOCK_TTL);
+      } else {
+        console.warn(`Lost lock ownership for ${job.fileId}`);
+        clearInterval(heartbeat);
+      }
+    } catch (err) {
+      console.error('Heartbeat error:', err);
+    }
+  }, 60_000);
+  
   const type = getType(job.size);
 
   // Step 0: Acquire a processing slot based on job type
   const acquired = await acquire(type);
   if (!acquired) {
+    const retries = job.retryCount || 0;
+
+    if (retries > 3) {
+      await updateJobStage(job.fileId, 'failed', 'admission_failed', {
+        error: 'Admission limit exceeded',
+      });
+      return;
+    }
+
     await new Promise(r => setTimeout(r, 2000));
 
-    // REQUEUE instead of fail
     await enqueueFile({
       ...job,
-      retryCount: (job.retryCount || 0) + 1,
+      retryCount: retries + 1,
     });
 
     return;
@@ -121,6 +176,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     /** Stage 1: Downloading the input file */
     await updateJobStage(job.fileId, jobStatus, 'downloading', {
       startedAt: startTime,
+      bullJob,
     });
     await download(job.inputUrl, inputPath);
 
@@ -128,7 +184,12 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     if (job.fileType === 'video') {
       await updateJobStage(job.fileId, 'processing', 'processing');
     
-    const duration = getDuration(inputPath);
+    let duration = 0;
+    try {
+      duration = getDuration(inputPath);
+    } catch {
+      duration = 5 * 60 * 1000; // fallback
+    }
 
     // normalize FFmpeg progress → percentage
     await processVideo(inputPath, outputPath, async (timeMs: number) => {
@@ -137,12 +198,12 @@ export async function handleJob(job: FileJob, bullJob?: any) {
        * This is an approximation.
        * Proper fix requires ffprobe duration (advanced).
        */
-      const APPROX_DURATION = 5 * 60 * 1000; // 5 min fallback
 
       const percent = Math.min((timeMs / duration) * 100, 100);
 
       await updateJobStage(job.fileId, 'processing', 'processing', {
-        progress: percent, // now real %
+        progress: percent,
+        bullJob,
       });
 
       bullJob?.updateProgress(percent);
@@ -160,6 +221,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       duration: Date.now() - startTime,
       output: result,
       success: true,
+      bullJob,
     });
 
   } catch (err: any) {
@@ -175,6 +237,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       attemptsMade: bullJob?.attemptsMade || 0,
       maxAttempts: bullJob?.opts.attempts || 1,
       success: false,
+      bullJob,
     });
 
     /** Requeue logic or Dead Letter Queue (DLQ) */
@@ -182,6 +245,34 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       const shouldRequeue = job.size < 500 * 1024 * 1024;
 
       const totalRetries = job.retryCount || 0;
+
+      /**
+       * Detect poison jobs (same failure repeating)
+       */
+      const lastError = err.message || 'unknown';
+
+      const prevError = await connection.hget(`job:${job.fileId}`, 'lastError');
+
+      const isSameError = prevError === lastError;
+
+      /**
+       * If same error repeats, stop retrying early
+       */
+      if (isSameError && totalRetries >= 2) {
+        console.log(`Poison job detected: ${job.fileId}`);
+
+        await connection.rpush(
+          'dead-letter-queue',
+          JSON.stringify({ ...job, error: lastError })
+        );
+
+        return;
+      }
+
+      /**
+       * Store last error for comparison
+       */
+      await connection.hset(`job:${job.fileId}`, 'lastError', lastError);
 
       if (shouldRequeue && totalRetries < MAX_TOTAL_RETRIES) {
         console.log(`Requeueing job ${job.fileId} (attempt ${totalRetries + 1})`);
@@ -220,5 +311,16 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         } catch { }
       }, 1000 * 60 * 30); // 30 minutes retention
     }
+
+    // Release lock
+    try {
+      const owner = await connection.get(lockKey);
+      if (owner === WORKER_ID) {
+        await connection.del(lockKey);
+      }
+    } catch (err) {
+      console.error('Lock release error:', err);
+    }
+    clearInterval(heartbeat);
   }
 }

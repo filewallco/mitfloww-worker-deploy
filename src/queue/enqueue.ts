@@ -60,9 +60,8 @@ async function getPriority(job: FileJob): Promise<number> {
    * - Every minute reduces priority slightly
    */
   const agingFactor = 0.1; // tuneable
-  const createdAt = Number(
-    await connection.hget(`job:${job.fileId}`, 'createdAt')
-  );
+  const createdAtRaw = await connection.hget(`job:${job.fileId}`, 'createdAt');
+  const createdAt = createdAtRaw ? Number(createdAtRaw) : Date.now();
 
   const waitingMinutes = (Date.now() - createdAt) / 60000;
 
@@ -106,7 +105,8 @@ export async function enqueueFile(job: FileJob) {
       sessionId,
       status: 'queued',
       stage: 'waiting',
-      createdAt: Date.now(),
+      createdAt: existing.createdAt ? Number(existing.createdAt) : Date.now(),
+      queuedAt: Date.now(),
 
       inputUrl: job.inputUrl,
       outputKey: job.outputKey,
@@ -146,8 +146,7 @@ export async function enqueueFile(job: FileJob) {
    * Add job to the appropriate queue
    */
   return queue.add(sizeType, job, {
-    jobId: `${job.fileId}-${Date.now()}`,
-    originalId: job.fileId,
+    jobId: job.fileId,
     priority: await getPriority(job),
     attempts: ATTEMPTS[sizeType],
     backoff: {
