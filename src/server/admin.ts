@@ -2,13 +2,14 @@ import { smallQueue, mediumQueue, largeQueue } from '../queue/queues';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
 import { imageQueue } from '../queue/queues';
+import { JOB_STAGE, JOB_STATUS, QUEUE_NAME } from '../constants';
 
 /**
  * Returns structured system snapshot.
  * Separates LIVE jobs and HISTORY jobs.
  */
 export async function getSystemSnapshot() {
-  const keys = (await scanKeys('job:[^:]*')).filter(
+  const keys = (await scanKeys('job:*')).filter(
     k => !k.includes(':logs')
   );
 
@@ -89,7 +90,7 @@ export async function getSystemSnapshot() {
      * 1. BullMQ runtime state
      * 2. Redis stored state
      */
-    const state = queueState || meta.status || 'unknown';
+    const state = queueState ?? meta.status ?? 'unknown';
 
     /**
      * Compute queue position based on resolved state
@@ -99,9 +100,9 @@ export async function getSystemSnapshot() {
 
     if (queueState === 'waiting') {
       let queueRef =
-        job.queueName === 'small-files'
+        job.queueName === QUEUE_NAME.SMALL
           ? smallQueue
-          : job.queueName === 'medium-files'
+          : job.queueName === QUEUE_NAME.MEDIUM
             ? mediumQueue
             : largeQueue;
 
@@ -125,8 +126,8 @@ export async function getSystemSnapshot() {
     const eta = speed > 0 ? (100 - progress) / speed : null;
 
     let queueSize = 0;
-    if (job.queueName === 'small-files') queueSize = smallCount;
-    else if (job.queueName === 'medium-files') queueSize = mediumCount;
+    if (job.queueName === QUEUE_NAME.SMALL) queueSize = smallCount;
+    else if (job.queueName === QUEUE_NAME.MEDIUM) queueSize = mediumCount;
     else queueSize = largeCount;
 
     const avgProcessingTime = 30000; // start with 30s baseline
@@ -148,7 +149,7 @@ export async function getSystemSnapshot() {
       fileName: job.data?.inputUrl?.split(/[\\/]/).pop(),
       size: Number(meta.size || 0),
       queuePosition,
-      stage: meta.stage || 'waiting',
+      stage: meta.stage || JOB_STAGE.WAITING,
       userTier: meta.userTier || 'free',
       error: meta.error || null,
 
@@ -169,18 +170,18 @@ export async function getSystemSnapshot() {
     /**
      * Classify into LIVE vs HISTORY
      */
-    if (state === 'completed') {
+    if (state === JOB_STATUS.COMPLETED) {
       stats.completed++;
       history.push(formatted);
-    } else if (state === 'failed') {
+    } else if (state === JOB_STATUS.FAILED) {
       stats.failed++;
       history.push(formatted);
     } else {
       live.push(formatted);
 
-      if (formatted.stage === 'waiting') stats.waiting++;
-      if (formatted.stage === 'processing') stats.processing++;
-      if (formatted.stage === 'uploading') stats.uploading++;
+      if (formatted.stage === JOB_STAGE.WAITING) stats.waiting++;
+      if (formatted.stage === JOB_STAGE.PROCESSING) stats.processing++;
+      if (formatted.stage === JOB_STAGE.UPLOADING) stats.uploading++;
     }
   }
 
@@ -217,7 +218,7 @@ async function scanKeys(pattern: string): Promise<string[]> {
  * - no update for > X time
  */
 export async function recoverStuckJobs() {
-  const keys = (await scanKeys('job:[^:]*')).filter(
+  const keys = (await scanKeys('job:*')).filter(
     k => !k.includes(':logs')
   );
 
@@ -243,17 +244,20 @@ export async function recoverStuckJobs() {
     /**
      * Skip if actually active in BullMQ
      */
-    if (state === 'active') continue;
+    if (state === 'active') {
+      const updatedAt = Number(meta.updatedAt || 0);
+      if (now - updatedAt < STUCK_THRESHOLD) continue;
+    }
 
-    if (meta.status === 'processing') {
+    if (meta.status === JOB_STATUS.PROCESSING) {
       const updatedAt = Number(meta.updatedAt || 0);
 
       if (now - updatedAt > STUCK_THRESHOLD) {
         console.log(`Recovering stuck job: ${jobId}`);
 
         await connection.hset(key, {
-          status: 'retrying',
-          stage: 'stuck_recovery',
+          status: JOB_STATUS.RETRYING,
+          stage: JOB_STAGE.STUCK_RECOVERY,
         });
 
         const existing =

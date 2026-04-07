@@ -1,8 +1,7 @@
 import fs from 'fs';
 import https from 'https';
 import path from 'path';
-
-const MODE = process.env.MODE || 'local';
+import { config } from '../config';
 
 /**
  * Downloads a file from a URL or local file path.
@@ -12,7 +11,7 @@ const MODE = process.env.MODE || 'local';
  * @param dest - Destination path to save the file
  */
 export async function download(url: string, dest: string) {
-  if (MODE === 'local' && url.startsWith('file://')) {
+  if (config.mode === 'local' && url.startsWith('file://')) {
     // For local testing, just copy the file from local path
     const localPath = url.replace('file://', '');
     await fs.promises.copyFile(localPath, dest);
@@ -55,7 +54,7 @@ export async function download(url: string, dest: string) {
  * @returns Path or URL of the uploaded file
  */
 export async function upload(filePath: string, key: string): Promise<string> {
-  if (MODE === 'local') {
+  if (config.mode === 'local') {
     const outputDir = './outputs';
 
     // Ensure output directory exists

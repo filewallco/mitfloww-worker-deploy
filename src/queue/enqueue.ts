@@ -1,6 +1,7 @@
 import { smallQueue, mediumQueue, largeQueue, imageQueue } from './queues';
 import { ATTEMPTS, FileJob } from '../types';
 import { connection } from './connection';
+import { FILE_TYPE, JOB_STAGE, JOB_STATUS, QUEUE_NAME, REDIS_KEYS } from '../constants';
 
 const MB = 1024 * 1024;
 
@@ -25,7 +26,7 @@ function classify(size: number): 'small' | 'medium' | 'large' {
  * @returns numeric base priority
  */
 function basePriority(job: FileJob): number {
-  if (job.fileType === 'image') return -10;
+  if (job.fileType === FILE_TYPE.IMAGE) return -10;
   const sizeType = classify(job.size);
 
   const tierWeight = {
@@ -61,7 +62,7 @@ async function getPriority(job: FileJob): Promise<number> {
    * - Every minute reduces priority slightly
    */
   const agingFactor = 0.1; // tuneable
-  const createdAtRaw = await connection.hget(`job:${job.fileId}`, 'createdAt');
+  const createdAtRaw = await connection.hget(REDIS_KEYS.JOB(job.fileId), 'createdAt');
   const createdAt = createdAtRaw ? Number(createdAtRaw) : Date.now();
 
   const waitingMinutes = (Date.now() - createdAt) / 60000;
@@ -91,7 +92,7 @@ export async function enqueueFile(job: FileJob) {
   /**
    * Preserve retry history if exists
    */
-  const existing = await connection.hgetall(`job:${job.fileId}`);
+  const existing = await connection.hgetall(REDIS_KEYS.JOB(job.fileId));
 
   const retryCount = existing.retryCount
     ? Number(existing.retryCount) + 1
@@ -102,10 +103,10 @@ export async function enqueueFile(job: FileJob) {
    * Redis becomes the single source of truth for UI.
    */
   try {
-    await connection.hset(`job:${job.fileId}`, {
+    await connection.hset(REDIS_KEYS.JOB(job.fileId), {
       sessionId,
-      status: 'queued',
-      stage: 'waiting',
+      status: JOB_STATUS.QUEUED,
+      stage: JOB_STAGE.WAITING,
       createdAt: existing.createdAt ? Number(existing.createdAt) : Date.now(),
       queuedAt: Date.now(),
 
@@ -123,23 +124,23 @@ export async function enqueueFile(job: FileJob) {
       retryCount,
       queueName:
         sizeType === 'small'
-          ? 'small-files'
+          ? QUEUE_NAME.SMALL
           : sizeType === 'medium'
-            ? 'medium-files'
-            : 'large-files',
+            ? QUEUE_NAME.MEDIUM
+            : QUEUE_NAME.LARGE,
     });
   } catch (e) {
     console.error('REDIS WRITE FAILED', e);
   }
 
   // Set a TTL of 24 hours for job metadata
-  await connection.expire(`job:${job.fileId}`, 60 * 60 * 24);
+  await connection.expire(REDIS_KEYS.JOB(job.fileId), 60 * 60 * 24);
   /**
    * Select correct queue based on file size
    */
   let queue;
 
-  if (job.fileType === 'image') {
+  if (job.fileType === FILE_TYPE.IMAGE) {
     queue = imageQueue;
   } else {
     if (sizeType === 'small') queue = smallQueue;

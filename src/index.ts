@@ -15,21 +15,20 @@ import './worker/heavyWorker';
 import './worker/imageWorker';
 
 process.env.SESSION_ID = Date.now().toString();
-const MODE = (process.env.MODE as 'local' | 'server') || 'local';
 
 /**
  * Entry point for MitFloww.
  * - Server mode: starts HTTP server.
  * - Local mode: runs test runner for enqueuing jobs.
  */
-if (MODE === 'server') {
+if (config.mode === 'server') {
   const { startServer } = require('./server');
   startServer();
 } else {
   require('./localTest');
 }
 
-console.log(`Running in ${MODE} mode`);
+console.log(`Running in ${config.mode} mode`);
 startAdminServer();
 startWS();
 

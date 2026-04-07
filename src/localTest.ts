@@ -3,6 +3,7 @@ import path from 'path';
 import { enqueueFile } from './queue/enqueue';
 import { randomUUID } from 'crypto';
 import { FileJob } from './types';
+import { FILE_TYPE } from './constants';
 import { fileTypeFromFile } from 'file-type';
 
 const TEST_DIR = path.join(__dirname, '../test-files');
@@ -18,8 +19,6 @@ const seen = new Set<string>();
 async function enqueueSafe(file: string) {
   if (seen.has(file)) return;
 
-  seen.add(file);
-
   const fullPath = path.join(TEST_DIR, file);
   const stats = fs.statSync(fullPath);
   const detected = await fileTypeFromFile(fullPath);
@@ -29,12 +28,12 @@ async function enqueueSafe(file: string) {
     return;
   }
 
-  let fileType: FileJob['fileType'] = 'other';
+  let fileType: FileJob['fileType'] = FILE_TYPE.OTHER;
 
   if (detected.mime.startsWith('image/')) {
-    fileType = 'image';
+    fileType = FILE_TYPE.IMAGE;
   } else if (detected.mime.startsWith('video/')) {
-    fileType = 'video';
+    fileType = FILE_TYPE.VIDEO;
   } else {
     console.log(`Unsupported file type: ${detected.mime}`);
     return;
@@ -43,7 +42,7 @@ async function enqueueSafe(file: string) {
   const extImage = path.extname(file);
 
   const outputKey =
-    fileType === 'image'
+    fileType === FILE_TYPE.IMAGE
       ? `local/${path.parse(file).name}${extImage}`
       : `local/${file}`;
   
@@ -58,6 +57,7 @@ async function enqueueSafe(file: string) {
 
   console.log(`ENQUEUE CALLED: ${file}`);
   await enqueueFile(job);
+  seen.add(file);
 }
 
 /**

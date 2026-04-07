@@ -6,6 +6,7 @@ import { enqueueFile } from '../queue/enqueue';
 import { connection } from '../queue/connection';
 import fs from 'fs';
 import path from 'path';
+import { FILE_TYPE, REDIS_KEYS } from '../constants';
 
 export function startAdminServer() {
   const server = http.createServer(async (req, res) => {
@@ -44,17 +45,22 @@ export function startAdminServer() {
           : ext === '.ts'
           ? 'video/mp2t'
           : 'video/mp4';
-      res.writeHead(200, {
-        'Content-Type': contentType,
+        res.writeHead(200, {
+          'Content-Type': contentType,
 
-        // REQUIRED FOR HLS SEGMENT FETCHING
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Range',
+          /**
+           * Required for HLS playback + segment fetching
+           */
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Allow-Headers': 'Range',
 
-        // REQUIRED FOR VIDEO STREAMING
-        'Accept-Ranges': 'bytes',
-      });
+          /**
+           * Required for progressive playback
+           */
+          'Cache-Control': 'no-cache',
+          'Accept-Ranges': 'bytes',
+        });
 
       stream.pipe(res);
       return;
@@ -109,7 +115,7 @@ export function startAdminServer() {
         return;
       }
 
-      const key = await connection.get(`preview:${id}`);
+      const key = await connection.get(REDIS_KEYS.PREVIEW(id));
 
       if (!key) {
         res.writeHead(404);
@@ -155,12 +161,12 @@ export function startAdminServer() {
        * Validate and narrow Redis string values into proper types
        */
       const fileType =
-        meta.fileType === 'video' ||
-          meta.fileType === 'pdf' ||
-          meta.fileType === 'zip' ||
-          meta.fileType === 'other'
+        meta.fileType === FILE_TYPE.VIDEO ||
+          meta.fileType === FILE_TYPE.PDF ||
+          meta.fileType === FILE_TYPE.ZIP ||
+          meta.fileType === FILE_TYPE.OTHER
           ? meta.fileType
-          : 'other';
+          : FILE_TYPE.OTHER;
 
       const userTier =
         meta.userTier === 'free' ||

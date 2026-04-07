@@ -20,7 +20,7 @@ function validateEnv(name: string, value: any) {
  */
 export const config = {
   /** Running mode: 'local' for development/testing, 'server' for production */
-  mode: validateEnv('MODE', process.env.MODE || 'local'),
+  mode: validateEnv('MODE', process.env.MODE),
 
   /** Redis connection configuration */
   redis: {
