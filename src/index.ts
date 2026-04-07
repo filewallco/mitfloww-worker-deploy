@@ -18,7 +18,7 @@ process.env.SESSION_ID = Date.now().toString();
 const MODE = (process.env.MODE as 'local' | 'server') || 'local';
 
 /**
- * Entry point for FileWall.
+ * Entry point for MitFloww.
  * - Server mode: starts HTTP server.
  * - Local mode: runs test runner for enqueuing jobs.
  */

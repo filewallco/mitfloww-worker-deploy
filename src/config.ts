@@ -15,7 +15,7 @@ function validateEnv(name: string, value: any) {
 }
 
 /**
- * Centralized configuration for FileWall application.
+ * Centralized configuration for MitFloww application.
  * Environment variables take precedence, defaults are fallback values.
  */
 export const config = {
@@ -32,7 +32,7 @@ export const config = {
   ffmpegPath: validateEnv('FFMPEG_PATH', process.env.FFMPEG_PATH || 'ffmpeg'),
 
   /** Temporary directory for processing files */
-  tempDir: process.env.TEMP_DIR || path.join(os.tmpdir(), 'filewall'),
+  tempDir: process.env.TEMP_DIR || path.join(os.tmpdir(), 'mitfloww'),
 
   /** Directory where processed outputs are saved */
   outputDir: process.env.OUTPUT_DIR || path.resolve('./outputs'),

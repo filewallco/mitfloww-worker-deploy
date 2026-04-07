@@ -1,4 +1,4 @@
-# File Processing Worker (FileWall) – README
+# File Processing Worker (MitFloww) – README
 
 ## Overview
 
@@ -401,9 +401,9 @@ Frontend should:
 ***Start Docker***
 
 ```bash
-docker run -d -p 6379:6379 --name filewall-redis redis
-docker stop filewall-redis
-docker start filewall-redis
+docker run -d -p 6379:6379 --name mitfloww-redis redis
+docker stop mitfloww-redis
+docker start mitfloww-redis
 ```
 
 ***Run node server***

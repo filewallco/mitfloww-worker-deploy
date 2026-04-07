@@ -1,5 +1,5 @@
 /**
- * Defines the structure of a file processing job in FileWall
+ * Defines the structure of a file processing job in MitFloww
  */
 export interface FileJob {
   /** Unique identifier for the job/file */
