@@ -37,8 +37,13 @@ export const config = {
   /** Directory where processed outputs are saved */
   outputDir: process.env.OUTPUT_DIR || path.resolve('./outputs'),
 
-  /** Maximum concurrency for job processing */
-  concurrency: Number(validateEnv('MAX_CONCURRENCY', process.env.MAX_CONCURRENCY || 5)),
+  /** Worker-specific concurrency */
+  concurrency: {
+    fast: Number(validateEnv('FAST_CONCURRENCY', process.env.FAST_CONCURRENCY || 5)),
+    medium: Number(validateEnv('MEDIUM_CONCURRENCY', process.env.MEDIUM_CONCURRENCY || 3)),
+    heavy: Number(validateEnv('HEAVY_CONCURRENCY', process.env.HEAVY_CONCURRENCY || 1)),
+    image: Number(validateEnv('IMAGE_CONCURRENCY', process.env.IMAGE_CONCURRENCY || 10)),
+  },
 
   /** Rate limit configuration (e.g., for uploads or API requests) */
   rateLimit: {

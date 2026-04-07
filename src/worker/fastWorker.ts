@@ -1,6 +1,7 @@
 import { Worker } from 'bullmq';
 import { connection } from '../queue/connection';
 import { handleJob } from './handler';
+import { config } from '../config';
 
 /**
  * Worker for SMALL files (fast lane)
@@ -14,6 +15,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: 5, // high concurrency for small files
+    concurrency: config.concurrency.fast, // high concurrency for small files
   }
 );

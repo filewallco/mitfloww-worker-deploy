@@ -1,6 +1,7 @@
 import { Worker } from 'bullmq';
 import { connection } from '../queue/connection';
 import { handleJob } from './handler';
+import { config } from '../config';
 
 /**
  * Worker for MEDIUM files
@@ -13,6 +14,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: 3,
+    concurrency: config.concurrency.medium,
   }
 );

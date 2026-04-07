@@ -1,6 +1,7 @@
 import { Worker } from 'bullmq';
 import { connection } from '../queue/connection';
 import { handleJob } from './handler';
+import { config } from '../config';
 
 /**
  * Worker for LARGE files (heavy processing)
@@ -13,6 +14,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: 1, // heavy jobs → low concurrency
+    concurrency: config.concurrency.heavy, // heavy jobs → low concurrency
   }
 );

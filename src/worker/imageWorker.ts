@@ -1,6 +1,7 @@
 import { Worker } from 'bullmq';
 import { connection } from '../queue/connection';
 import { handleJob } from './handler';
+import { config } from '../config';
 
 new Worker(
   'image-files',
@@ -10,6 +11,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: 15,
+    concurrency: config.concurrency.image,
   }
 );
