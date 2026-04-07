@@ -37,13 +37,22 @@ export const config = {
   /** Directory where processed outputs are saved */
   outputDir: process.env.OUTPUT_DIR || path.resolve('./outputs'),
 
-  /** Worker-specific concurrency */
-  concurrency: {
-    fast: Number(validateEnv('FAST_CONCURRENCY', process.env.FAST_CONCURRENCY || 5)),
-    medium: Number(validateEnv('MEDIUM_CONCURRENCY', process.env.MEDIUM_CONCURRENCY || 3)),
-    heavy: Number(validateEnv('HEAVY_CONCURRENCY', process.env.HEAVY_CONCURRENCY || 1)),
-    image: Number(validateEnv('IMAGE_CONCURRENCY', process.env.IMAGE_CONCURRENCY || 10)),
-  },
+  /**
+   * Worker concurrency tuning
+   *
+   * IMPORTANT:
+   * These values must be aligned with CPU + disk constraints.
+   *
+   * Strategy:
+   * - fast   → high throughput, low cost jobs
+   * - medium → balanced
+   * - heavy  → strictly serialized (avoid system lock)
+   * - image  → lightweight CPU tasks
+   */
+  fast: Number(validateEnv('FAST_CONCURRENCY', process.env.FAST_CONCURRENCY || 2)),
+  medium: Number(validateEnv('MEDIUM_CONCURRENCY', process.env.MEDIUM_CONCURRENCY || 2)),
+  heavy: Number(validateEnv('HEAVY_CONCURRENCY', process.env.HEAVY_CONCURRENCY || 1)), // MUST stay 1
+  image: Number(validateEnv('IMAGE_CONCURRENCY', process.env.IMAGE_CONCURRENCY || 4)),
 
   /** Rate limit configuration (e.g., for uploads or API requests) */
   rateLimit: {
@@ -68,6 +77,5 @@ console.log('Configuration loaded:', {
   ffmpegPath: config.ffmpegPath,
   tempDir: config.tempDir,
   outputDir: config.outputDir,
-  concurrency: config.concurrency,
   rateLimit: config.rateLimit,
 });

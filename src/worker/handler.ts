@@ -14,6 +14,88 @@ import { spawn } from 'child_process';
 import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
 
 /**
+ * GLOBAL CPU LIMITER
+ *
+ * Purpose:
+ * Prevents total CPU oversubscription across all workers.
+ * Even if per-queue concurrency is high, this enforces a hard global cap.
+ *
+ * Design:
+ * - Uses Redis as a distributed semaphore
+ * - Ensures correctness across multiple processes/containers
+ *
+ * NOTE:
+ * - Keep this conservative (e.g., <= number of CPU cores)
+ */
+const GLOBAL_CPU_LIMIT = Number(process.env.GLOBAL_CPU_LIMIT || 4);
+const CPU_KEY = 'global:cpu';
+
+/**
+ * Acquire a CPU slot (blocking with retry)
+ */
+async function acquireCpuSlot(): Promise<void> {
+  while (true) {
+    const current = Number(await connection.get(CPU_KEY) || 0);
+
+    if (current < GLOBAL_CPU_LIMIT) {
+      const ok = await connection.multi()
+        .incr(CPU_KEY)
+        .expire(CPU_KEY, 60) // safety TTL
+        .exec();
+
+      if (ok) return;
+    }
+
+    await new Promise(r => setTimeout(r, 100)); // backoff
+  }
+}
+
+/**
+ * Release a CPU slot
+ */
+async function releaseCpuSlot(): Promise<void> {
+  try {
+    const val = await connection.decr(CPU_KEY);
+    if (val <= 0) await connection.del(CPU_KEY);
+  } catch {}
+}
+
+/**
+ * GLOBAL DISK RESERVATION TRACKER
+ *
+ * Problem:
+ * Multiple workers may pass disk check simultaneously → crash later.
+ *
+ * Solution:
+ * Reserve disk space in Redis BEFORE processing starts.
+ * Guarantees system-wide disk safety.
+ */
+const DISK_KEY = 'global:disk_reserved';
+
+/**
+ * Reserve disk space (bytes)
+ */
+async function reserveDisk(bytes: number): Promise<boolean> {
+  const free = getFreeDiskSpace();
+  const reserved = Number(await connection.get(DISK_KEY) || 0);
+
+  if (free - reserved < bytes) return false;
+
+  await connection.incrby(DISK_KEY, bytes);
+  return true;
+}
+
+/**
+ * Release reserved disk
+ */
+async function releaseDisk(bytes: number): Promise<void> {
+  try {
+    const val = await connection.decrby(DISK_KEY, bytes);
+    if (val <= 0) await connection.del(DISK_KEY);
+  } catch {}
+}
+
+/**
  * Ensures file is fully written before processing/uploading.
  *
  * WHY:
@@ -195,6 +277,11 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   // }
 
   /**
+   * Acquire global CPU slot BEFORE heavy work begins
+   */
+  await acquireCpuSlot();
+
+  /**
    * STEP 3: Prepare temp dir BEFORE download
    */
   await fs.promises.mkdir(tempDir, { recursive: true });
@@ -203,6 +290,22 @@ export async function handleJob(job: FileJob, bullJob?: any) {
    * STEP 4: Download AFTER admission (FIXED)
    */
   await download(job.inputUrl, inputPath);
+
+  /**
+   * Reserve disk AFTER knowing actual file size on disk
+   *
+   * Heuristic:
+   * - input file
+   * - output file (approx same size)
+   * - buffer (safety)
+   */
+  const REQUIRED_DISK = job.size * 3;
+
+  const reserved = await reserveDisk(REQUIRED_DISK);
+
+  if (!reserved) {
+    throw new Error('Global disk reservation failed (insufficient space)');
+  }
 
   /**
    * STEP 5: Compute accurate TTL AFTER download
@@ -611,6 +714,18 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   } finally {
     // await release(type); // admission release code
+
+    /**
+     * Release global CPU slot
+     */
+    await releaseCpuSlot();
+
+    /**
+     * Release reserved disk
+     */
+    try {
+      await releaseDisk(job.size * 3);
+    } catch {}
 
     /**
      * Cleanup strategy:
