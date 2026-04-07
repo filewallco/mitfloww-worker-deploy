@@ -14,6 +14,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: config.concurrency.medium,
+    concurrency: config.medium,
   }
 );

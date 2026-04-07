@@ -13,6 +13,29 @@ import { processImage } from '../processors/image';
 import { spawn } from 'child_process';
 import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
 
+const USER_ACTIVE_KEY = (userId: string) => `user:${userId}:active`;
+const MAX_ACTIVE_PER_USER = 1;
+
+function getCpuLimit(): number {
+  // 1. Respect explicit override
+  if (process.env.GLOBAL_CPU_LIMIT) {
+    return Number(process.env.GLOBAL_CPU_LIMIT);
+  }
+
+  // 2. Try Docker CPU quota (cgroup v2)
+  try {
+    const data = require('fs').readFileSync('/sys/fs/cgroup/cpu.max', 'utf8');
+    const [quota, period] = data.trim().split(' ');
+
+    if (quota !== 'max') {
+      return Math.max(1, Math.floor(Number(quota) / Number(period)));
+    }
+  } catch {}
+
+  // 3. Fallback to host cores
+  return os.cpus().length;
+}
+
 /**
  * GLOBAL CPU LIMITER
  *
@@ -27,7 +50,7 @@ import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
  * NOTE:
  * - Keep this conservative (e.g., <= number of CPU cores)
  */
-const GLOBAL_CPU_LIMIT = Number(process.env.GLOBAL_CPU_LIMIT || 4);
+const GLOBAL_CPU_LIMIT = getCpuLimit();
 const CPU_KEY = 'global:cpu';
 
 /**
@@ -275,6 +298,20 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   //   return;
   // }
+
+  /**
+   * PER-USER LIMIT
+   */
+  const userKey = USER_ACTIVE_KEY(job.userTier); // TODO: (you should use userId later)
+
+  const active = Number(await connection.get(userKey) || 0);
+
+  if (active >= MAX_ACTIVE_PER_USER) {
+    throw new Error('User concurrency limit reached');
+  }
+
+  await connection.incr(userKey);
+  await connection.expire(userKey, 3600);
 
   /**
    * Acquire global CPU slot BEFORE heavy work begins
@@ -719,6 +756,14 @@ export async function handleJob(job: FileJob, bullJob?: any) {
      * Release global CPU slot
      */
     await releaseCpuSlot();
+
+    /**
+     * Release user slot
+     */
+    try {
+      const val = await connection.decr(userKey);
+      if (val <= 0) await connection.del(userKey);
+    } catch {}
 
     /**
      * Release reserved disk

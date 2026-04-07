@@ -11,6 +11,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: config.concurrency.image,
+    concurrency: config.image,
   }
 );

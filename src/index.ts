@@ -21,15 +21,27 @@ process.env.SESSION_ID = Date.now().toString();
  * - Server mode: starts HTTP server.
  * - Local mode: runs test runner for enqueuing jobs.
  */
-if (config.mode === 'server') {
+if (config.mode === 'local') {
+  require('./localTest');
+} else if (config.mode === 'server') {
   const { startServer } = require('./server');
   startServer();
 } else {
-  require('./localTest');
+  throw new Error(`Invalid MODE: ${config.mode}`);
 }
 
 console.log(`Running in ${config.mode} mode`);
-startAdminServer();
+if (process.env.WORKER_ONLY === 'true') {
+  console.log('Starting WORKER only');
+} else if (process.env.API_ONLY === 'true') {
+  console.log('Starting API only');
+  startAdminServer();
+  startWS();
+} else {
+  console.log('Starting FULL app');
+  startAdminServer();
+  startWS();
+}
 startWS();
 
 console.log("ACTUAL MODE:", process.env.MODE);

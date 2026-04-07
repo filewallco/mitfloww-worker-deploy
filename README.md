@@ -428,4 +428,8 @@ docker ps
 docker rm <container_id>
 ```
 
+***Build and run***
+```bash
+docker-compose up --build
+```
 ---

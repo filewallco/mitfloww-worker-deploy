@@ -14,6 +14,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: config.concurrency.heavy, // heavy jobs → low concurrency
+    concurrency: config.heavy, // heavy jobs → low concurrency
   }
 );

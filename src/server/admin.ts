@@ -183,6 +183,11 @@ export async function getSystemSnapshot() {
       if (formatted.stage === JOB_STAGE.PROCESSING) stats.processing++;
       if (formatted.stage === JOB_STAGE.UPLOADING) stats.uploading++;
     }
+
+    await connection.hset(`job:${job.id}`, {
+      queuePosition,
+      queueETA
+    });
   }
 
   return { stats, live, history };

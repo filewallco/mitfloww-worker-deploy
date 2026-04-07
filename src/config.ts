@@ -20,7 +20,7 @@ function validateEnv(name: string, value: any) {
  */
 export const config = {
   /** Running mode: 'local' for development/testing, 'server' for production */
-  mode: validateEnv('MODE', process.env.MODE),
+  mode: process.env.MODE || 'server',
 
   /** Redis connection configuration */
   redis: {
@@ -32,10 +32,10 @@ export const config = {
   ffmpegPath: validateEnv('FFMPEG_PATH', process.env.FFMPEG_PATH || 'ffmpeg'),
 
   /** Temporary directory for processing files */
-  tempDir: process.env.TEMP_DIR || path.join(os.tmpdir(), 'mitfloww'),
+  tempDir: process.env.TEMP_DIR || '/app/tmp',
 
   /** Directory where processed outputs are saved */
-  outputDir: process.env.OUTPUT_DIR || path.resolve('./outputs'),
+  outputDir: process.env.OUTPUT_DIR || '/app/outputs',
 
   /**
    * Worker concurrency tuning

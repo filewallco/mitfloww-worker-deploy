@@ -1,6 +1,14 @@
 import { spawn, execSync } from 'child_process';
 import path from 'path';
 import { config } from '../config';
+import os from 'os';
+
+function getFfmpegThreads(): number {
+  const total = os.cpus().length;
+
+  // keep some headroom for Node + Redis
+  return Math.max(1, Math.floor(total * 0.6));
+}
 
 /**
  * Executes FFmpeg to process a video:
@@ -51,7 +59,7 @@ export function processVideo(
       '-crf', '28',
       '-c:a', 'aac',
       '-progress', 'pipe:2',
-      '-threads', '1',
+      '-threads',  String(getFfmpegThreads()),
       output,
     ];
 

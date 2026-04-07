@@ -15,6 +15,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: config.concurrency.fast, // high concurrency for small files
+    concurrency: config.fast, // high concurrency for small files
   }
 );

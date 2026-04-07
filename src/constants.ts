@@ -20,6 +20,7 @@ export const JOB_STAGE = {
   UPLOADING: 'uploading',
   DONE: 'done',
   FAILED: 'failed',
+  CANCELLED: 'cancelled',
   STUCK_RECOVERY: 'stuck_recovery',
 } as const;
 

@@ -7,6 +7,7 @@ import { connection } from '../queue/connection';
 import fs from 'fs';
 import path from 'path';
 import { FILE_TYPE, REDIS_KEYS } from '../constants';
+import { imageQueue, largeQueue, mediumQueue, smallQueue } from '../queue/queues';
 
 export function startAdminServer() {
   const server = http.createServer(async (req, res) => {
@@ -203,6 +204,64 @@ export function startAdminServer() {
         fileType,
         size: size,
         userTier,
+      });
+
+      res.writeHead(200);
+      res.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    /**
+     * Public job status (USER SAFE)
+     */
+    if (req.url?.startsWith('/job/')) {
+      const id = req.url.split('/').pop();
+
+      if (!id) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid job id' }));
+        return;
+      }
+
+      const meta = await connection.hgetall(`job:${id}`);
+
+      if (!meta || Object.keys(meta).length === 0) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Job not found' }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: meta.status,
+        stage: meta.stage,
+        progress: Number(meta.progress || 0),
+        queueName: meta.queueName,
+        createdAt: meta.createdAt,
+        startedAt: meta.startedAt,
+        completedAt: meta.completedAt,
+        error: meta.error || null
+      }));
+
+      return;
+    }
+
+    if (req.url?.startsWith('/job/cancel/')) {
+      const id = req.url.split('/').pop();
+
+      const job =
+        await imageQueue.getJob(id!) ||
+        await smallQueue.getJob(id!) ||
+        await mediumQueue.getJob(id!) ||
+        await largeQueue.getJob(id!);
+
+      if (job) {
+        await job.remove();
+      }
+
+      await connection.hset(`job:${id}`, {
+        status: 'cancelled',
+        stage: 'failed',
       });
 
       res.writeHead(200);

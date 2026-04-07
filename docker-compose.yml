@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  worker:
+    build: .
+    container_name: mitfloww-worker
+    command: node dist/index.js
+    depends_on:
+      - redis
+    environment:
+      MODE: server
+      WORKER_ONLY: true
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      FFMPEG_PATH: ffmpeg
+      TEMP_DIR: /app/tmp
+      OUTPUT_DIR: /app/outputs
+      FAST_CONCURRENCY: 2
+      MEDIUM_CONCURRENCY: 2
+      HEAVY_CONCURRENCY: 1
+      IMAGE_CONCURRENCY: 4
+    volumes:
+      - ./outputs:/app/outputs
+      - ./tmp:/app/tmp
+  api:
+    build: .
+    command: node dist/server.js
+    environment:
+      MODE: server
+      API_ONLY: true
+    ports:
+      - "4000:4000"
+      - "4001:4001"
+
+  redis:
+    image: redis:7
+    container_name: mitfloww-redis
+    ports:
+      - "6379:6379"
