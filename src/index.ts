@@ -11,6 +11,7 @@ import './worker/fastWorker';
 import './worker/standardWorker';
 import './worker/heavyWorker';
 import './worker/imageWorker';
+import { startPriorityScheduler } from './scheduler/priorityScheduler';
 
 process.env.SESSION_ID = Date.now().toString();
 
@@ -32,6 +33,7 @@ console.log(`Running in ${config.mode} mode`);
 
 startAdminServer();
 startWS();
+startPriorityScheduler();
 
 setInterval(() => {
   recoverStuckJobs().catch(console.error);

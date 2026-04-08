@@ -49,3 +49,6 @@ export const REDIS_KEYS = {
   LOCK: (id: string) => `lock:${id}`,
   DLQ: 'dead-letter-queue',
 };
+
+// MB size
+export const MB = 1024 * 1024;

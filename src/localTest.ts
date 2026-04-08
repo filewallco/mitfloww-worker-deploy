@@ -10,6 +10,7 @@ const TEST_DIR = path.join(__dirname, '../test-files');
 
 /**
  * Local in-memory dedup (fast)
+ * Keeps track of files already processed in this runtime
  */
 const seen = new Set<string>();
 
@@ -40,11 +41,11 @@ async function enqueueSafe(file: string) {
    *   SET key value EX seconds NX
    */
   const already = await connection.set(
-    FILE_SEEN_KEY(file),
-    '1',
-    'EX',
-    60 * 60,
-    'NX'
+    FILE_SEEN_KEY(file), // Redis key
+    '1', // value
+    'EX', // expiry type = seconds
+    60 * 60, // TTL
+    'NX' // only set the key if it does NOT already exist
   );
 
   if (!already) return;
@@ -53,8 +54,7 @@ async function enqueueSafe(file: string) {
 
   if (!fs.existsSync(fullPath)) return;
 
-  const stats = fs.statSync(fullPath);
-
+  const stats = fs.statSync(fullPath); // Get file size
   const detected = await fileTypeFromFile(fullPath);
 
   if (!detected) {
@@ -76,7 +76,6 @@ async function enqueueSafe(file: string) {
     fileType === FILE_TYPE.IMAGE
       ? `local/${path.parse(file).name}${path.extname(file)}`
       : `local/${file}`;
-
   const job: FileJob = {
     fileId: randomUUID(),
     inputUrl: `file://${fullPath}`,
@@ -85,11 +84,8 @@ async function enqueueSafe(file: string) {
     size: stats.size,
     userTier: 'free',
   };
-
   console.log(`ENQUEUE CALLED: ${file}`);
-
   await enqueueFile(job);
-
   seen.add(file);
 }
 
@@ -106,7 +102,7 @@ async function initialScan() {
 }
 
 /**
- * NEW: Polling loop for new files
+ * Polling loop for new files
  */
 function startPolling() {
   setInterval(async () => {
