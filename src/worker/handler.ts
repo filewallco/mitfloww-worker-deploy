@@ -290,19 +290,17 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   const inputPath = path.join(tempDir, 'input');
   const outputBase = path.join(tempDir, 'output');
   const lockKey = REDIS_KEYS.LOCK(job.fileId);
-
   /**
    * IDEMPOTENCY LOCK (CRITICAL)
    * Prevent duplicate execution
-   */
-  /**
+   * 
    * STEP 1: Acquire idempotency lock (LONG TTL)
    */
   const acquiredLock = await connection.set(
     lockKey,
     WORKER_ID,
     'PX',
-    LOCK_TTL, // <-- FIX: no short TTL
+    LOCK_TTL,
     'NX'
   );
 
@@ -313,6 +311,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   console.log(`LOCK ACQUIRED: ${job.fileId} by ${WORKER_ID}`);
 
+  //  #region admission control lock
   // /**
   //  * STEP 2: Admission control (CRITICAL)
   //  */
@@ -339,12 +338,11 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   //   return;
   // }
-
+  // # endregion
   /**
    * PER-USER LIMIT
    */
   const userKey = USER_ACTIVE_KEY(job.userTier); // TODO: (you should use userId later)
-
   const active = Number(await connection.get(userKey) || 0);
 
   if (active >= MAX_ACTIVE_PER_USER) {
@@ -414,7 +412,6 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   }
 
   await connection.pexpire(lockKey, Math.max(ttl, LOCK_TTL));
-
   /**
    * Ensure job has initial state without overwriting enqueue metadata
    */
@@ -443,7 +440,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   }, 60_000);
 
 
-  // Uncomment this for admission to handle slot allocation.
+  // #region Uncomment this for admission to handle slot allocation.
   // // Step 0: Acquire a processing slot based on job type
   // const acquired = await acquire(type);
   // if (!acquired) {
@@ -465,6 +462,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   //   return;
   // }
+  // #endregion
 
   let outputPath = '';
 
@@ -501,7 +499,6 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         bullJob,
       });
     }
-    // --- ONLY THE VIDEO SECTION CHANGED ---
     // Everything else remains as you wrote (already solid)
 
     else if (job.fileType === FILE_TYPE.VIDEO) {
@@ -566,7 +563,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     });
 
   } catch (err: any) {
-    console.error('JOB FAILED:', job.fileId, err);  
+    console.error('JOB FAILED:', job.fileId, err);
     // Determine if the job can still be retried
     const isRetrying = bullJob && bullJob.attemptsMade < (bullJob.opts.attempts || 1);
     jobStatus = isRetrying ? JOB_STATUS.RETRYING : JOB_STATUS.FAILED;
@@ -663,37 +660,21 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     } catch {
       // swallow — cleanup must never crash worker
     }
-    
+
     /**
      * Cleanup strategy:
      * - Always clean on success
      * - Keep failed temp for retry BUT limit retention
      */
-    /**
-     * TEMP DEBUG MODE:
-     * Do NOT delete temp after success
-     */
-    // if (jobStatus === JOB_STATUS.COMPLETED) {
-    //   console.log('TEMP PRESERVED (SUCCESS):', tempDir);
-    // }
-    // comment for debug
     const previewExists = await connection.get(REDIS_KEYS.PREVIEW(job.fileId));
     if (jobStatus === JOB_STATUS.COMPLETED && previewExists) {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
-    } 
+    }
     else {
       /**
        * Schedule delayed cleanup for failed jobs to allow for retries and debugging.
        * Prevent disk explosion
        */
-
-      /**
-       * TEMP DEBUG MODE:
-       * Do NOT delete temp after failure
-       */
-      // console.log('TEMP PRESERVED (FAILURE):', tempDir);
-      
-      // Comment for debug.
       setTimeout(async () => {
         try {
           const previewExists = await connection.get(REDIS_KEYS.PREVIEW(job.fileId));
