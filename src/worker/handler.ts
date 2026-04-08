@@ -6,7 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
-import { getDuration } from '../processors/video';
+import { generatePreviewClip, getDuration, processVideo } from '../processors/video';
 import { getFreeDiskSpace } from '../utils/disk';
 import { config } from '../config';
 import { processImage } from '../processors/image';
@@ -53,23 +53,34 @@ function getCpuLimit(): number {
 const GLOBAL_CPU_LIMIT = getCpuLimit();
 const CPU_KEY = 'global:cpu';
 
+const ACQUIRE_CPU_LUA = `
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+local limit = tonumber(ARGV[1])
+
+if current < limit then
+  current = redis.call("INCR", KEYS[1])
+  redis.call("EXPIRE", KEYS[1], 60)
+  return 1
+else
+  return 0
+end
+`;
+
 /**
  * Acquire a CPU slot (blocking with retry)
  */
 async function acquireCpuSlot(): Promise<void> {
   while (true) {
-    const current = Number(await connection.get(CPU_KEY) || 0);
+    const ok = await connection.eval(
+      ACQUIRE_CPU_LUA,
+      1,
+      CPU_KEY,
+      GLOBAL_CPU_LIMIT
+    );
 
-    if (current < GLOBAL_CPU_LIMIT) {
-      const ok = await connection.multi()
-        .incr(CPU_KEY)
-        .expire(CPU_KEY, 60) // safety TTL
-        .exec();
+    if (ok === 1) return;
 
-      if (ok) return;
-    }
-
-    await new Promise(r => setTimeout(r, 100)); // backoff
+    await new Promise(r => setTimeout(r, 100));
   }
 }
 
@@ -95,17 +106,34 @@ async function releaseCpuSlot(): Promise<void> {
  */
 const DISK_KEY = 'global:disk_reserved';
 
+const RESERVE_DISK_LUA = `
+local reserved = tonumber(redis.call("GET", KEYS[1]) or "0")
+local free = tonumber(ARGV[1])
+local required = tonumber(ARGV[2])
+
+if (free - reserved) >= required then
+  redis.call("INCRBY", KEYS[1], required)
+  redis.call("EXPIRE", KEYS[1], 60)
+  return 1
+else
+  return 0
+end
+`;
+
 /**
  * Reserve disk space (bytes)
  */
 async function reserveDisk(bytes: number): Promise<boolean> {
   const free = getFreeDiskSpace();
-  const reserved = Number(await connection.get(DISK_KEY) || 0);
+  const ok = await connection.eval(
+    RESERVE_DISK_LUA,
+    1,
+    DISK_KEY,
+    free,
+    bytes
+  );
 
-  if (free - reserved < bytes) return false;
-
-  await connection.incrby(DISK_KEY, bytes);
-  return true;
+  return ok === 1;
 }
 
 /**
@@ -342,15 +370,23 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   await download(job.inputUrl, inputPath);
 
   /**
-   * Reserve disk AFTER knowing actual file size on disk
-   *
-   * Heuristic:
-   * - input file
-   * - output file (approx same size)
-   * - buffer (safety)
+   * Calculate required disk:
+   * - 2x file size (input + output)
+   * - minimum 500MB safety buffer
    */
   const REQUIRED_DISK = Math.max(job.size * 2, 500 * 1024 * 1024);
 
+  /**
+   * Persist exact reservation value.
+   * CRITICAL: This must be used during release to prevent drift.
+   */
+  await connection.hset(REDIS_KEYS.JOB(job.fileId), {
+    reservedDisk: REQUIRED_DISK
+  });
+
+  /**
+   * Attempt to reserve disk atomically
+   */
   const reserved = await reserveDisk(REQUIRED_DISK);
 
   if (!reserved) {
@@ -442,15 +478,11 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     });
 
     const free = getFreeDiskSpace();
-
-    if (free < config.disk.minFreeBytes) {
-      throw new Error(`Insufficient disk space: ${Math.round(free / 1e9)} GB left`);
-    }
-
     const REQUIRED = job.size * 3; // input + output + buffer
+    const reserved = Number(await connection.get(DISK_KEY) || 0);
 
-    if (free < REQUIRED) {
-      throw new Error('Not enough disk for this job');
+    if (free - reserved < REQUIRED) {
+      throw new Error('Not enough disk (after reservation)');
     }
 
     /** Stage 2: Processing */
@@ -473,234 +505,46 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     // Everything else remains as you wrote (already solid)
 
     else if (job.fileType === FILE_TYPE.VIDEO) {
-      const duration = getDuration(inputPath) || 5 * 60 * 1000;
-
-      const hlsDir = path.join(tempDir, 'hls');
-      await fs.promises.mkdir(hlsDir, { recursive: true });
-
-      const hlsOutput = path.join(hlsDir, 'index.m3u8');
+      const previewPath = path.join(tempDir, 'preview.mp4');
 
       /**
-       * Tracks uploaded files with timestamp (prevents memory bloat)
+       * STEP 1: Generate preview (cheap)
        */
-      const uploaded = new Map<string, number>();
+      await generatePreviewClip(inputPath, previewPath, 8);
 
       /**
-       * Tracks files currently being processed (prevents duplicate uploads)
+       * STEP 2: Upload preview early
        */
-      const processing = new Set<string>();
+      const previewKey = `${job.outputKey}/preview.mp4`;
 
-      const MAX_TRACKED_FILES = 5000;
+      await upload(previewPath, previewKey);
 
       /**
-       * Upload a file if not already uploaded
-       * Thread-safe via `processing` guard
+       * Store preview reference
        */
-      async function uploadIfNeeded(file: string) {
-        if (uploaded.has(file)) return;
-        if (processing.has(file)) return;
-
-        processing.add(file);
-
-        try {
-          const fullPath = path.join(hlsDir, file);
-          const key = `${job.outputKey}/hls/${file}`;
-
-          // Wait until file is fully written
-          await waitForStableFile(fullPath);
-
-          await upload(fullPath, key);
-
-          uploaded.set(file, Date.now());
-
-          /**
-           * Cleanup old entries (prevents memory growth)
-           */
-          if (uploaded.size > MAX_TRACKED_FILES) {
-            const now = Date.now();
-            for (const [k, t] of uploaded) {
-              if (now - t > 60_000) {
-                uploaded.delete(k);
-              }
-            }
-          }
-
-        } catch (err: any) {
-          if (err.code !== 'ENOENT') {
-            console.error('Upload failed:', file, err);
-          }
-        } finally {
-          processing.delete(file);
-        }
-      }
+      await connection.set(
+        REDIS_KEYS.PREVIEW(job.fileId),
+        previewKey
+      );
 
       /**
-       * Wait until enough segments exist for playback
-       * Ensures preview won't break in UI
+       * STEP 3: Full processing (single output)
        */
-      async function waitForInitialSegments() {
-        while (true) {
-          try {
-            const files = await fs.promises.readdir(hlsDir);
-            const tsCount = files.filter(f => f.endsWith('.ts')).length;
+      const finalOutput = `${outputBase}.mp4`;
 
-            if (tsCount >= 3) return; // ~12 seconds buffer
-          } catch { }
-
-          await new Promise(r => setTimeout(r, 300));
-        }
-      }
-
-      await new Promise((resolve, reject) => {
-
-        /**
-         * FILE WATCHER
-         *
-         * NOTE:
-         * fs.watch is NOT reliable → only used as a trigger
-         * Actual correctness is guaranteed by:
-         *   - waitForStableFile
-         *   - scanner fallback
-         */
-        const watcher = fs.watch(hlsDir, (_, filename) => {
-          if (!filename) return;
-
-          uploadIfNeeded(filename); // fire-and-forget
-        });
-
-        /**
-         * FALLBACK SCANNER (CRITICAL)
-         *
-         * Guarantees:
-         * - No missed files
-         * - Handles fs.watch failures under load
-         */
-        const scanInterval = setInterval(async () => {
-          try {
-            const files = await fs.promises.readdir(hlsDir);
-
-            for (const file of files) {
-              await uploadIfNeeded(file);
-            }
-          } catch (err) {
-            console.error('Scanner error:', err);
+      await processVideo(inputPath, finalOutput, undefined, async (progress) => {
+        await updateJobStage(
+          job.fileId,
+          JOB_STATUS.PROCESSING,
+          JOB_STAGE.PROCESSING,
+          {
+            progress,
+            bullJob,
           }
-        }, 1000);
-
-        /**
-         * FFmpeg HLS generation
-         */
-        const ffmpeg = spawn(config.ffmpegPath, [
-          '-i', inputPath,
-
-          '-vf', 'scale=-2:360',
-          '-c:v', 'libx264',
-          '-c:a', 'aac',
-
-          '-hls_time', '4',
-          '-hls_list_size', '6',
-          '-hls_segment_filename', path.join(hlsDir, 'segment%03d.ts'),
-          '-hls_flags', 'append_list+omit_endlist',
-          '-start_number', '0',
-
-          '-f', 'hls',
-          '-progress', 'pipe:2',
-          hlsOutput,
-        ]);
-
-        let buffer = '';
-
-        /**
-         * Progress parsing (line-safe)
-         */
-        ffmpeg.stderr.on('data', async (data) => {
-          buffer += data.toString();
-
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (line.startsWith('out_time_ms=')) {
-              const value = Number(line.split('=')[1]);
-
-              if (!isNaN(value) && duration) {
-                const percent = Math.min((value / duration) * 100, 100);
-
-                await updateJobStage(
-                  job.fileId,
-                  JOB_STATUS.PROCESSING,
-                  JOB_STAGE.PROCESSING,
-                  {
-                    progress: percent,
-                    bullJob,
-                  }
-                );
-              }
-            }
-          }
-        });
-
-        /**
-         * EXPOSE PREVIEW ONLY WHEN SAFE
-         *
-         * Guarantees:
-         * - segments exist
-         * - playlist exists
-         * - playlist uploaded
-         */
-        (async () => {
-          await waitForInitialSegments();
-
-          await waitForStableFile(hlsOutput);
-          await uploadIfNeeded('index.m3u8');
-
-          /**
-           * Only expose preview AFTER:
-           * - playlist exists
-           * - at least 3 segments uploaded
-           */
-          await waitForInitialSegments();
-
-          await waitForStableFile(hlsOutput);
-          await uploadIfNeeded('index.m3u8');
-
-          await connection.set(
-            REDIS_KEYS.PREVIEW(job.fileId),
-            `${job.outputKey}/hls/index.m3u8`
-          );
-        })();
-
-        /**
-         * FFmpeg exit handling
-         */
-        ffmpeg.on('close', async (code) => {
-          watcher.close();
-          clearInterval(scanInterval);
-
-          // Final sync (ensures no file missed)
-          const files = await fs.promises.readdir(hlsDir);
-          for (const file of files) {
-            await uploadIfNeeded(file);
-          }
-
-          if (code === 0) resolve(null);
-          else reject(new Error(`FFmpeg failed with code ${code}`));
-        });
-
-        /**
-         * Spawn failure
-         */
-        ffmpeg.on('error', (err) => {
-          try {
-            watcher.close();
-            clearInterval(scanInterval);
-          } catch { }
-
-          reject(err);
-        });
+        );
       });
 
-      outputPath = hlsOutput;
+      outputPath = finalOutput;
     }
 
     /** Stage 3: Uploading the processed file */
@@ -791,7 +635,6 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
   } finally {
     // await release(type); // admission release code
-
     /**
      * Release global CPU slot
      */
@@ -806,12 +649,21 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     } catch { }
 
     /**
-     * Release reserved disk
+     * Release EXACT reserved disk.
+     * Prevents drift between reserve/release values.
      */
     try {
-      await releaseDisk(job.size * 3);
-    } catch { }
+      const reservedDisk = Number(
+        await connection.hget(REDIS_KEYS.JOB(job.fileId), 'reservedDisk') || 0
+      );
 
+      if (reservedDisk > 0) {
+        await releaseDisk(reservedDisk);
+      }
+    } catch {
+      // swallow — cleanup must never crash worker
+    }
+    
     /**
      * Cleanup strategy:
      * - Always clean on success
@@ -821,13 +673,14 @@ export async function handleJob(job: FileJob, bullJob?: any) {
      * TEMP DEBUG MODE:
      * Do NOT delete temp after success
      */
-    if (jobStatus === JOB_STATUS.COMPLETED) {
-      console.log('TEMP PRESERVED (SUCCESS):', tempDir);
-    }
-    // Uncomment for prod to keep failed temp for debugging and retries.
     // if (jobStatus === JOB_STATUS.COMPLETED) {
-    //   await fs.promises.rm(tempDir, { recursive: true, force: true });
-    // } 
+    //   console.log('TEMP PRESERVED (SUCCESS):', tempDir);
+    // }
+    // comment for debug
+    const previewExists = await connection.get(REDIS_KEYS.PREVIEW(job.fileId));
+    if (jobStatus === JOB_STATUS.COMPLETED && previewExists) {
+      await fs.promises.rm(tempDir, { recursive: true, force: true });
+    } 
     else {
       /**
        * Schedule delayed cleanup for failed jobs to allow for retries and debugging.
@@ -838,14 +691,17 @@ export async function handleJob(job: FileJob, bullJob?: any) {
        * TEMP DEBUG MODE:
        * Do NOT delete temp after failure
        */
-      console.log('TEMP PRESERVED (FAILURE):', tempDir);
+      // console.log('TEMP PRESERVED (FAILURE):', tempDir);
       
-      // Uncomment for prod to keep failed temp for debugging and retries.
-      // setTimeout(async () => {
-      //   try {
-      //     await fs.promises.rm(tempDir, { recursive: true, force: true });
-      //   } catch { }
-      // }, 1000 * 60 * 30); // 30 minutes retention
+      // Comment for debug.
+      setTimeout(async () => {
+        try {
+          const previewExists = await connection.get(REDIS_KEYS.PREVIEW(job.fileId));
+          if (jobStatus === JOB_STATUS.COMPLETED && previewExists) {
+            await fs.promises.rm(tempDir, { recursive: true, force: true });
+          }
+        } catch { }
+      }, 1000 * 60 * 30); // 30 minutes retention
     }
 
     // Release lock

@@ -3,11 +3,17 @@ import path from 'path';
 import { config } from '../config';
 import os from 'os';
 
+/**
+ * Compute FFmpeg thread allocation.
+ * Strategy:
+ * - Avoid CPU oversubscription
+ * - Scale with global CPU limit
+ */
 function getFfmpegThreads(): number {
-  const total = os.cpus().length;
+  const globalLimit = Number(process.env.GLOBAL_CPU_LIMIT || os.cpus().length);
 
-  // keep some headroom for Node + Redis
-  return Math.max(1, Math.floor(total * 0.6));
+  // Divide CPU across expected parallel jobs
+  return Math.max(1, Math.floor(globalLimit / 4));
 }
 
 /**
@@ -146,6 +152,43 @@ export function processVideo(
     });
 
     ffmpeg.on('error', safeReject);
+  });
+}
+
+/**
+ * Generate a lightweight preview clip (first N seconds)
+ * This replaces expensive HLS preview generation.
+ */
+export function generatePreviewClip(
+  input: string,
+  output: string,
+  seconds: number = 8
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn(config.ffmpegPath, [
+      '-y',
+      '-i', input,
+
+      '-t', String(seconds),
+
+      '-vf', 'scale=-2:360',
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '30',
+
+      '-an', // no audio → saves CPU
+
+      '-threads', String(2),
+
+      output,
+    ]);
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Preview generation failed: ${code}`));
+    });
+
+    ffmpeg.on('error', reject);
   });
 }
 

@@ -93,8 +93,6 @@ export function startAdminServer() {
 
         fs.createReadStream(filePath).pipe(res);
       }
-
-      stream.pipe(res);
       return;
     }
 
