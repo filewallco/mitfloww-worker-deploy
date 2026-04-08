@@ -16,6 +16,6 @@ new Worker(
   },
   {
     connection,
-    concurrency: Math.min(config.fast, os.cpus().length)
+    concurrency: config.fast
   }
 );
