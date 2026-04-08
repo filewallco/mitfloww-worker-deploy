@@ -32,10 +32,10 @@ export const config = {
   ffmpegPath: validateEnv('FFMPEG_PATH', process.env.FFMPEG_PATH || 'ffmpeg'),
 
   /** Temporary directory for processing files */
-  tempDir: process.env.TEMP_DIR || '/app/tmp',
+  tempDir: process.env.TEMP_DIR || path.join(process.cwd(), 'tmp'),
 
   /** Directory where processed outputs are saved */
-  outputDir: process.env.OUTPUT_DIR || '/app/outputs',
+  outputDir: process.env.OUTPUT_DIR || path.join(process.cwd(), 'outputs'),
 
   /**
    * Worker concurrency tuning

@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { FILE_TYPE, REDIS_KEYS } from '../constants';
 import { imageQueue, largeQueue, mediumQueue, smallQueue } from '../queue/queues';
+import { config } from '../config';
 
 export function startAdminServer() {
   const server = http.createServer(async (req, res) => {
@@ -62,6 +63,36 @@ export function startAdminServer() {
           'Cache-Control': 'no-cache',
           'Accept-Ranges': 'bytes',
         });
+        
+      const stat = fs.statSync(filePath);
+      const range = req.headers.range;
+
+      if (range) {
+        const parts = range.replace(/bytes=/, "").split("-");
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+
+        const chunkSize = end - start + 1;
+        const file = fs.createReadStream(filePath, { start, end });
+
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunkSize,
+          'Content-Type': contentType,
+          'Access-Control-Allow-Origin': '*'
+        });
+
+        file.pipe(res);
+      } else {
+        res.writeHead(200, {
+          'Content-Length': stat.size,
+          'Content-Type': contentType,
+          'Access-Control-Allow-Origin': '*'
+        });
+
+        fs.createReadStream(filePath).pipe(res);
+      }
 
       stream.pipe(res);
       return;
@@ -125,7 +156,7 @@ export function startAdminServer() {
       }
 
       const url =
-        process.env.MODE === 'local'
+        config.mode === 'local'
           ? `http://localhost:4000/static/${key}`
           : `https://your-r2-domain/${key}`;
 

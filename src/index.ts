@@ -1,11 +1,9 @@
-import dotenv from 'dotenv';
-dotenv.config({ path: '.env.local' });
-
+import 'dotenv/config';
+import { config } from './config';
 import { recoverStuckJobs } from './server/admin';
 import { startAdminServer } from './server/http';
 import { startWS } from './server/ws';
 import { getFreeDiskSpace } from './utils/disk';
-import { config } from './config';
 import { cleanupTempDir } from './utils/cleanup';
 
 // Import workers to initialize queues
@@ -31,20 +29,9 @@ if (config.mode === 'local') {
 }
 
 console.log(`Running in ${config.mode} mode`);
-if (process.env.WORKER_ONLY === 'true') {
-  console.log('Starting WORKER only');
-} else if (process.env.API_ONLY === 'true') {
-  console.log('Starting API only');
-  startAdminServer();
-  startWS();
-} else {
-  console.log('Starting FULL app');
-  startAdminServer();
-  startWS();
-}
-startWS();
 
-console.log("ACTUAL MODE:", process.env.MODE);
+startAdminServer();
+startWS();
 
 setInterval(() => {
   recoverStuckJobs().catch(console.error);
