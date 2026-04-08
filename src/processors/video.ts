@@ -64,6 +64,7 @@ export function processVideo(
       '-preset', 'fast',
       '-crf', '28',
       '-c:a', 'aac',
+      '-movflags', '+faststart',
       '-progress', 'pipe:2',
       '-threads',  String(getFfmpegThreads()),
       output,
@@ -95,6 +96,7 @@ export function processVideo(
     }
 
     ffmpeg.stderr.on('data', (data) => {
+      console.error('[FFMPEG]', data.toString());
       buffer += data.toString();
 
       const lines = buffer.split('\n');
@@ -112,15 +114,19 @@ export function processVideo(
                 // progressive mode
                 const chunkProgress =
                   value / (options.duration ? options.duration * 1000 : options.totalDuration);
-
                 const scaled =
                   (options.progressOffset || 0) +
                   chunkProgress * (options.progressScale || 100);
-
-                onProgress(Math.min(scaled, 100));
+                var percentage = Math.min((scaled / 100) * 100, 100) ?? 100;
+                onProgress(percentage);
               } else {
                 // fallback (old behavior)
-                onProgress(value);
+                onProgress(value);const percent = Math.min(
+                  (value / (options?.totalDuration || 1)) * 100,
+                  100
+                );
+
+                onProgress(percent);
               }
             }
           }
@@ -172,12 +178,12 @@ export function generatePreviewClip(
       '-t', String(seconds),
 
       '-vf', 'scale=-2:360',
+      '-pix_fmt', 'yuv420p', // ensures compatibility with more players
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-crf', '30',
-
+      '-movflags', '+faststart',
       '-an', // no audio → saves CPU
-
       '-threads', String(2),
 
       output,

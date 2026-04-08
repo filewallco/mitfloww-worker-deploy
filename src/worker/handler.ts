@@ -368,6 +368,30 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   await download(job.inputUrl, inputPath);
 
   /**
+   * Remux MKV → MP4 container (no re-encode)
+   * Prevents timestamp / stream issues
+   */
+  let safeInput = inputPath;
+
+  if (job.fileType === FILE_TYPE.VIDEO && inputPath.endsWith('.mkv')) {
+    const remuxed = path.join(tempDir, 'remux.mp4');
+
+    await new Promise((res, rej) => {
+      const ff = spawn(config.ffmpegPath, [
+        '-y',
+        '-i', inputPath,
+        '-c', 'copy',
+        remuxed,
+      ]);
+
+      ff.on('close', (c) => (c === 0 ? res(null) : rej()));
+      ff.on('error', rej);
+    });
+
+    safeInput = remuxed;
+  }
+
+  /**
    * Calculate required disk:
    * - 2x file size (input + output)
    * - minimum 500MB safety buffer
@@ -403,7 +427,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     let duration = 5 * 60 * 1000; // fallback 5 min
 
     try {
-      duration = getDuration(inputPath);
+      duration = getDuration(safeInput);
     } catch (err) {
       console.warn('FFPROBE FAILED, using fallback duration:', job.fileId);
     }
@@ -475,19 +499,11 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       bullJob,
     });
 
-    const free = getFreeDiskSpace();
-    const REQUIRED = job.size * 3; // input + output + buffer
-    const reserved = Number(await connection.get(DISK_KEY) || 0);
-
-    if (free - reserved < REQUIRED) {
-      throw new Error('Not enough disk (after reservation)');
-    }
-
     /** Stage 2: Processing */
     await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING);
 
     if (job.fileType === FILE_TYPE.IMAGE) {
-      const result = await processImage(inputPath, outputBase);
+      const result = await processImage(safeInput, outputBase);
       outputPath = result.outputPath;
 
       job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
@@ -504,32 +520,40 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     else if (job.fileType === FILE_TYPE.VIDEO) {
       const previewPath = path.join(tempDir, 'preview.mp4');
 
-      /**
-       * STEP 1: Generate preview (cheap)
-       */
-      await generatePreviewClip(inputPath, previewPath, 8);
+    /**
+     * STEP 1: Generate preview (light CPU)
+     */
+    await generatePreviewClip(safeInput, previewPath, 8);
 
-      /**
-       * STEP 2: Upload preview early
-       */
-      const previewKey = `${job.outputKey}/preview.mp4`;
+    /**
+     * STEP 2: Upload preview immediately
+     */
+    const previewKey = `${job.outputKey}/preview.mp4`;
+    await upload(previewPath, previewKey);
 
-      await upload(previewPath, previewKey);
+    await connection.set(
+      REDIS_KEYS.PREVIEW(job.fileId),
+      previewKey
+    );
 
-      /**
-       * Store preview reference
-       */
-      await connection.set(
-        REDIS_KEYS.PREVIEW(job.fileId),
-        previewKey
-      );
+    /**
+     * IMPORTANT:
+     * Release CPU after preview.
+     * Otherwise preview + full encode run inside same slot → overload.
+     */
+    await releaseCpuSlot();
 
-      /**
-       * STEP 3: Full processing (single output)
-       */
-      const finalOutput = `${outputBase}.mp4`;
+    /**
+     * Re-acquire CPU for heavy full encode
+     */
+    await acquireCpuSlot();
 
-      await processVideo(inputPath, finalOutput, undefined, async (progress) => {
+    /**
+     * STEP 3: Full processing (heavy CPU)
+     */
+    const finalOutput = `${outputBase}.mp4`;
+
+    await processVideo(safeInput, finalOutput, undefined, async (progress) => {
         await updateJobStage(
           job.fileId,
           JOB_STATUS.PROCESSING,
@@ -546,11 +570,10 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
     /** Stage 3: Uploading the processed file */
     await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.UPLOADING);
-    let result = "";
-    // For video, HLS already uploaded → skip final upload
-    if (job.fileType !== FILE_TYPE.VIDEO) {
-      result = await upload(outputPath, job.outputKey);
-    }
+    /**
+     * Upload final output for ALL file types (including video)
+     */
+    const result = await upload(outputPath, job.outputKey);
 
     /** Job successfully completed */
     jobStatus = JOB_STATUS.COMPLETED;

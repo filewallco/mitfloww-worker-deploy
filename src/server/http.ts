@@ -72,22 +72,21 @@ export function startAdminServer() {
         const start = parseInt(parts[0], 10);
         const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
 
-        const chunkSize = end - start + 1;
-        const file = fs.createReadStream(filePath, { start, end });
-
         res.writeHead(206, {
           'Content-Range': `bytes ${start}-${end}/${stat.size}`,
           'Accept-Ranges': 'bytes',
-          'Content-Length': chunkSize,
+          'Content-Length': end - start + 1,
           'Content-Type': contentType,
           'Access-Control-Allow-Origin': '*'
         });
 
-        file.pipe(res);
+        fs.createReadStream(filePath, { start, end }).pipe(res);
+
       } else {
         res.writeHead(200, {
           'Content-Length': stat.size,
           'Content-Type': contentType,
+          'Accept-Ranges': 'bytes',
           'Access-Control-Allow-Origin': '*'
         });
 
@@ -159,7 +158,7 @@ export function startAdminServer() {
           : `https://your-r2-domain/${key}`;
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(url));
+      res.end(JSON.stringify({ url }));
       return;
     }
 
