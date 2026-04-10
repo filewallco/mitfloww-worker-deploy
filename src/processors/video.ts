@@ -1,7 +1,38 @@
-import { spawn, execSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import path from 'path';
 import { config } from '../config';
 import os from 'os';
+
+type FfprobeStream = {
+  codec_type?: string;
+  codec_name?: string;
+  width?: number;
+  height?: number;
+  disposition?: {
+    default?: number;
+  };
+};
+
+type FfprobeFormat = {
+  format_name?: string;
+  duration?: string;
+};
+
+type FfprobePayload = {
+  streams?: FfprobeStream[];
+  format?: FfprobeFormat;
+};
+
+export type VideoProbe = {
+  formatName: string | null;
+  durationMs: number | null;
+  hasVideo: boolean;
+  hasAudio: boolean;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  width: number | null;
+  height: number | null;
+};
 
 /**
  * Compute FFmpeg thread allocation.
@@ -14,6 +45,55 @@ function getFfmpegThreads(): number {
 
   // Divide CPU across expected parallel jobs
   return Math.max(1, Math.floor(globalLimit / 4));
+}
+
+function clampProgress(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(value, 100));
+}
+
+function runFfprobe(file: string): FfprobePayload {
+  const out = execFileSync(config.ffprobePath, [
+    '-v',
+    'error',
+    '-show_entries',
+    'format=format_name,duration:stream=codec_type,codec_name,width,height,disposition',
+    '-of',
+    'json',
+    file,
+  ]);
+
+  return JSON.parse(out.toString()) as FfprobePayload;
+}
+
+function pickPrimaryStream(
+  streams: FfprobeStream[],
+  codecType: 'video' | 'audio'
+): FfprobeStream | undefined {
+  const matches = streams.filter((stream) => stream.codec_type === codecType);
+
+  if (matches.length === 0) return undefined;
+
+  return matches.find((stream) => stream.disposition?.default === 1) ?? matches[0];
+}
+
+export function inspectVideoInput(file: string): VideoProbe {
+  const payload = runFfprobe(file);
+  const streams = payload.streams ?? [];
+  const videoStream = pickPrimaryStream(streams, 'video');
+  const audioStream = pickPrimaryStream(streams, 'audio');
+  const durationSeconds = Number(payload.format?.duration ?? NaN);
+
+  return {
+    formatName: payload.format?.format_name ?? null,
+    durationMs: Number.isFinite(durationSeconds) ? durationSeconds * 1000 : null,
+    hasVideo: Boolean(videoStream),
+    hasAudio: Boolean(audioStream),
+    videoCodec: videoStream?.codec_name ?? null,
+    audioCodec: audioStream?.codec_name ?? null,
+    width: videoStream?.width ?? null,
+    height: videoStream?.height ?? null,
+  };
 }
 
 /**
@@ -54,15 +134,21 @@ export function processVideo(
       // FAST SEEK (important for large videos)
       ...(options?.start ? ['-ss', String(options.start)] : []),
 
+      '-fflags', '+genpts',
       '-i', input,
       '-i', watermark,
 
       ...(options?.duration ? ['-t', String(options.duration)] : []),
 
-      '-filter_complex', 'scale=-2:360[video];[video][1]overlay=10:10',
+      '-filter_complex', '[0:v:0]scale=-2:360[video];[video][1:v:0]overlay=10:10[vout]',
+      '-map', '[vout]',
+      '-map', '0:a:0?',
+      '-sn',
+      '-dn',
       '-c:v', 'libx264',
       '-preset', 'fast',
       '-crf', '28',
+      '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-movflags', '+faststart',
       '-progress', 'pipe:2',
@@ -110,23 +196,18 @@ export function processVideo(
             const value = Number(line.split('=')[1]);
 
             if (!isNaN(value)) {
+              const processedMs = value / 1000;
+
               if (options?.totalDuration) {
-                // progressive mode
+                const durationMs =
+                  options.duration ? options.duration * 1000 : options.totalDuration;
                 const chunkProgress =
-                  value / (options.duration ? options.duration * 1000 : options.totalDuration);
+                  durationMs > 0 ? processedMs / durationMs : 0;
                 const scaled =
                   (options.progressOffset || 0) +
                   chunkProgress * (options.progressScale || 100);
-                var percentage = Math.min((scaled / 100) * 100, 100) ?? 100;
-                onProgress(percentage);
-              } else {
-                // fallback (old behavior)
-                onProgress(value);const percent = Math.min(
-                  (value / (options?.totalDuration || 1)) * 100,
-                  100
-                );
 
-                onProgress(percent);
+                onProgress(clampProgress(scaled));
               }
             }
           }
@@ -173,7 +254,11 @@ export function generatePreviewClip(
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn(config.ffmpegPath, [
       '-y',
+      '-fflags', '+genpts',
       '-i', input,
+      '-map', '0:v:0',
+      '-sn',
+      '-dn',
 
       '-t', String(seconds),
 
@@ -210,9 +295,6 @@ export function generatePreviewClip(
  * @returns Duration in milliseconds
  */
 export function getDuration(file: string): number {
-  const out = execSync(
-    `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${file}"`
-  );
-
-  return parseFloat(out.toString()) * 1000;
+  const probe = inspectVideoInput(file);
+  return probe.durationMs ?? 0;
 }

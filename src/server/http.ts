@@ -6,9 +6,180 @@ import { enqueueFile } from '../queue/enqueue';
 import { connection } from '../queue/connection';
 import fs from 'fs';
 import path from 'path';
-import { FILE_TYPE, REDIS_KEYS } from '../constants';
+import { FILE_TYPE, JOB_STATUS, REDIS_KEYS } from '../constants';
 import { imageQueue, largeQueue, mediumQueue, smallQueue } from '../queue/queues';
 import { config } from '../config';
+
+const STATIC_ROOT = path.resolve(process.cwd(), 'outputs');
+const STATIC_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Range',
+  'Cache-Control': 'no-cache',
+  'Accept-Ranges': 'bytes',
+};
+
+function getContentType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+
+  if (ext === '.m3u8') return 'application/vnd.apple.mpegurl';
+  if (ext === '.ts') return 'video/mp2t';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.mov') return 'video/quicktime';
+  if (ext === '.webm') return 'video/webm';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.avif') return 'image/avif';
+  if (ext === '.heic') return 'image/heic';
+  if (ext === '.heif') return 'image/heif';
+  if (ext === '.tif' || ext === '.tiff') return 'image/tiff';
+  if (ext === '.svg') return 'image/svg+xml';
+
+  return 'application/octet-stream';
+}
+
+function normalizeStoredAssetKey(key: string): string {
+  return key
+    .replace(/\\/g, '/')
+    .replace(/^\.?\/*outputs\//, '')
+    .replace(/^\/+/, '');
+}
+
+function buildPublicAssetUrl(key: string): string {
+  const normalizedKey = normalizeStoredAssetKey(key);
+
+  return config.mode === 'local'
+    ? `http://localhost:4000/static/${encodeURI(normalizedKey)}`
+    : `https://your-r2-domain/${encodeURI(normalizedKey)}`;
+}
+
+function normalizePreviewKeys(keys: string[]) {
+  const normalizedKeys = keys
+    .map((key) => normalizeStoredAssetKey(key))
+    .filter(Boolean);
+
+  if (normalizedKeys.length === 0) return null;
+
+  const manifestKey = normalizedKeys.find((key) => key.endsWith('.m3u8'));
+
+  if (manifestKey) {
+    const segmentKeys = normalizedKeys.filter((key) => key !== manifestKey);
+
+    return {
+      kind: 'hls',
+      manifestKey,
+      manifestUrl: buildPublicAssetUrl(manifestKey),
+      keys: segmentKeys,
+      urls: segmentKeys.map((key) => buildPublicAssetUrl(key)),
+    };
+  }
+
+  if (normalizedKeys.length === 1) {
+    const [key] = normalizedKeys;
+    return {
+      kind: 'progressive',
+      key,
+      url: buildPublicAssetUrl(key),
+    };
+  }
+
+  return {
+    kind: 'segments',
+    keys: normalizedKeys,
+    urls: normalizedKeys.map((key) => buildPublicAssetUrl(key)),
+  };
+}
+
+function normalizePreviewPayload(value: unknown): any | null {
+  if (!value) return null;
+
+  if (Array.isArray(value)) {
+    return normalizePreviewKeys(value.filter((item): item is string => typeof item === 'string'));
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      const normalized = normalizePreviewPayload(parsed);
+      if (normalized) return normalized;
+    } catch {
+      // Legacy plain-string preview key
+    }
+
+    return normalizePreviewKeys([value]);
+  }
+
+  if (typeof value !== 'object') {
+    return null;
+  }
+
+  const preview = value as Record<string, unknown>;
+
+  if (typeof preview.key === 'string') {
+    const normalizedKey = normalizeStoredAssetKey(preview.key);
+
+    return {
+      kind: preview.kind === 'hls' ? 'hls' : 'progressive',
+      key: normalizedKey,
+      url: buildPublicAssetUrl(normalizedKey),
+      fallback: Boolean(preview.fallback),
+      source: preview.source ?? 'preview',
+    };
+  }
+
+  if (typeof preview.manifestKey === 'string') {
+    const manifestKey = normalizeStoredAssetKey(preview.manifestKey);
+    const segmentKeys = Array.isArray(preview.keys)
+      ? preview.keys
+          .filter((item): item is string => typeof item === 'string')
+          .map((key) => normalizeStoredAssetKey(key))
+      : [];
+
+    return {
+      kind: 'hls',
+      manifestKey,
+      manifestUrl: buildPublicAssetUrl(manifestKey),
+      keys: segmentKeys,
+      urls: segmentKeys.map((key) => buildPublicAssetUrl(key)),
+      fallback: Boolean(preview.fallback),
+      source: preview.source ?? 'preview',
+    };
+  }
+
+  if (Array.isArray(preview.keys)) {
+    return normalizePreviewKeys(
+      preview.keys.filter((item): item is string => typeof item === 'string')
+    );
+  }
+
+  return null;
+}
+
+async function resolvePreviewPayload(jobId: string) {
+  const previewKey = REDIS_KEYS.PREVIEW(jobId);
+  const previewType = await connection.type(previewKey);
+
+  if (previewType === 'string') {
+    const raw = await connection.get(previewKey);
+    return raw ? normalizePreviewPayload(raw) : null;
+  }
+
+  if (previewType === 'list') {
+    const items = await connection.lrange(previewKey, 0, -1);
+    return normalizePreviewPayload(items);
+  }
+
+  if (previewType === 'hash') {
+    const payload = await connection.hgetall(previewKey);
+    return Object.keys(payload).length > 0
+      ? normalizePreviewPayload(payload)
+      : null;
+  }
+
+  return null;
+}
 
 export function startAdminServer() {
   const server = http.createServer(async (req, res) => {
@@ -28,66 +199,63 @@ export function startAdminServer() {
      * In production, this should be replaced by CDN / object storage URLs.
      */
     if (req.url?.startsWith('/static/')) {
-      const relativePath = req.url.replace('/static/', '');
+      const requestPath = req.url.split('?')[0] || '';
+      const relativePath = decodeURIComponent(requestPath.replace('/static/', ''));
+      const filePath = path.resolve(STATIC_ROOT, relativePath);
 
-      const filePath = path.join(process.cwd(), 'outputs', relativePath);
-
-      if (!fs.existsSync(filePath)) {
-        res.writeHead(404);
-        res.end();
+      if (!filePath.startsWith(`${STATIC_ROOT}${path.sep}`) && filePath !== STATIC_ROOT) {
+        res.writeHead(403, { 'Content-Type': 'application/json', ...STATIC_HEADERS });
+        res.end(JSON.stringify({ error: 'Forbidden' }));
         return;
       }
 
-      const stream = fs.createReadStream(filePath);
-      const ext = path.extname(filePath);
+      let stat: fs.Stats;
 
-      const contentType =
-        ext === '.m3u8'
-          ? 'application/vnd.apple.mpegurl'
-          : ext === '.ts'
-          ? 'video/mp2t'
-          : 'video/mp4';
-        res.writeHead(200, {
-          'Content-Type': contentType,
+      try {
+        stat = await fs.promises.stat(filePath);
+      } catch {
+        res.writeHead(404, { 'Content-Type': 'application/json', ...STATIC_HEADERS });
+        res.end(JSON.stringify({ error: 'File not found' }));
+        return;
+      }
 
-          /**
-           * Required for HLS playback + segment fetching
-           */
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, OPTIONS',
-          'Access-Control-Allow-Headers': 'Range',
+      if (!stat.isFile()) {
+        res.writeHead(404, { 'Content-Type': 'application/json', ...STATIC_HEADERS });
+        res.end(JSON.stringify({ error: 'File not found' }));
+        return;
+      }
 
-          /**
-           * Required for progressive playback
-           */
-          'Cache-Control': 'no-cache',
-          'Accept-Ranges': 'bytes',
-        });
-        
-      const stat = fs.statSync(filePath);
+      const contentType = getContentType(filePath);
       const range = req.headers.range;
 
       if (range) {
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = Number(parts[0]);
+        const end = parts[1] ? Number(parts[1]) : stat.size - 1;
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start < 0 || end >= stat.size) {
+          res.writeHead(416, {
+            'Content-Range': `bytes */${stat.size}`,
+            'Content-Type': 'application/json',
+            ...STATIC_HEADERS,
+          });
+          res.end(JSON.stringify({ error: 'Invalid range' }));
+          return;
+        }
 
         res.writeHead(206, {
           'Content-Range': `bytes ${start}-${end}/${stat.size}`,
-          'Accept-Ranges': 'bytes',
           'Content-Length': end - start + 1,
           'Content-Type': contentType,
-          'Access-Control-Allow-Origin': '*'
+          ...STATIC_HEADERS,
         });
 
         fs.createReadStream(filePath, { start, end }).pipe(res);
-
       } else {
         res.writeHead(200, {
           'Content-Length': stat.size,
           'Content-Type': contentType,
-          'Accept-Ranges': 'bytes',
-          'Access-Control-Allow-Origin': '*'
+          ...STATIC_HEADERS,
         });
 
         fs.createReadStream(filePath).pipe(res);
@@ -144,21 +312,32 @@ export function startAdminServer() {
         return;
       }
 
-      const key = await connection.get(REDIS_KEYS.PREVIEW(id));
+      const preview = await resolvePreviewPayload(id);
 
-      if (!key) {
-        res.writeHead(404);
-        res.end(JSON.stringify({ error: 'Preview not ready' }));
+      if (preview) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(preview));
         return;
       }
 
-      const url =
-        config.mode === 'local'
-          ? `http://localhost:4000/static/${key}`
-          : `https://your-r2-domain/${key}`;
+      const meta = await connection.hgetall(REDIS_KEYS.JOB(id));
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ url }));
+      if (meta.status === JOB_STATUS.COMPLETED && meta.outputKey) {
+        const fallbackKey = normalizeStoredAssetKey(meta.outputKey);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          kind: 'progressive',
+          key: fallbackKey,
+          url: buildPublicAssetUrl(fallbackKey),
+          fallback: true,
+          source: 'final',
+        }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Preview not ready' }));
       return;
     }
 
@@ -242,7 +421,7 @@ export function startAdminServer() {
     /**
      * Public job status (USER SAFE)
      */
-    if (req.url?.startsWith('/job/')) {
+    if (req.url?.startsWith('/job/') && !req.url.startsWith('/job/cancel/')) {
       const id = req.url.split('/').pop();
 
       if (!id) {

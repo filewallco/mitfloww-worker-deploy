@@ -31,6 +31,9 @@ export const config = {
   /** Path to FFmpeg binary */
   ffmpegPath: validateEnv('FFMPEG_PATH', process.env.FFMPEG_PATH || 'ffmpeg'),
 
+  /** Path to FFprobe binary */
+  ffprobePath: validateEnv('FFPROBE_PATH', process.env.FFPROBE_PATH || 'ffprobe'),
+
   /** Temporary directory for processing files */
   tempDir: process.env.TEMP_DIR || path.join(process.cwd(), 'tmp'),
 
@@ -75,6 +78,7 @@ console.log('Configuration loaded:', {
   mode: config.mode,
   redis: config.redis,
   ffmpegPath: config.ffmpegPath,
+  ffprobePath: config.ffprobePath,
   tempDir: config.tempDir,
   outputDir: config.outputDir,
   rateLimit: config.rateLimit,

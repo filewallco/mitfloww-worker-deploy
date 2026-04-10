@@ -6,12 +6,14 @@ import fs from 'fs';
 import os from 'os';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
-import { generatePreviewClip, getDuration, processVideo } from '../processors/video';
+import { generatePreviewClip, inspectVideoInput, processVideo } from '../processors/video';
 import { getFreeDiskSpace } from '../utils/disk';
 import { config } from '../config';
 import { processImage } from '../processors/image';
 import { spawn } from 'child_process';
 import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
+import { fileTypeFromFile } from 'file-type';
+import { inferExtensionFromValue, isLikelyMatroska, normalizeExtension } from '../utils/media';
 
 const USER_ACTIVE_KEY = (userId: string) => `user:${userId}:active`;
 const MAX_ACTIVE_PER_USER = 100; // TODO: make this configurable per user tier
@@ -273,6 +275,67 @@ function computeVideoTTL(durationMs: number): number {
   );
 }
 
+type PreviewRecord = {
+  kind: 'progressive' | 'hls';
+  key?: string;
+  manifestKey?: string;
+  keys?: string[];
+  fallback?: boolean;
+  source?: 'preview' | 'final';
+};
+
+async function materializeInputPath(
+  rawInputPath: string,
+  job: FileJob
+): Promise<{ inputPath: string; detectedExt: string | null; detectedMime: string | null }> {
+  const detected = await fileTypeFromFile(rawInputPath).catch(() => undefined);
+  const detectedExt = normalizeExtension(detected?.ext);
+  const inferredExt =
+    detectedExt ??
+    inferExtensionFromValue(job.inputUrl) ??
+    inferExtensionFromValue(job.outputKey);
+
+  if (!inferredExt) {
+    return {
+      inputPath: rawInputPath,
+      detectedExt,
+      detectedMime: detected?.mime ?? null,
+    };
+  }
+
+  const resolvedPath = path.join(path.dirname(rawInputPath), `input${inferredExt}`);
+
+  if (resolvedPath !== rawInputPath) {
+    await fs.promises.rm(resolvedPath, { force: true });
+    await fs.promises.rename(rawInputPath, resolvedPath);
+  }
+
+  return {
+    inputPath: resolvedPath,
+    detectedExt: detectedExt ?? inferredExt,
+    detectedMime: detected?.mime ?? null,
+  };
+}
+
+function buildPreviewKey(outputKey: string): string {
+  const normalized = outputKey.replace(/\\/g, '/');
+  const parsed = path.posix.parse(normalized);
+  const previewFile = `${parsed.name || 'preview'}.preview.mp4`;
+
+  return parsed.dir
+    ? path.posix.join(parsed.dir, previewFile)
+    : previewFile;
+}
+
+async function storePreviewRecord(jobId: string, preview: PreviewRecord): Promise<void> {
+  await connection.set(
+    REDIS_KEYS.PREVIEW(jobId),
+    JSON.stringify(preview),
+    'EX',
+    60 * 60 * 24
+  );
+}
+
 /**
  * Main job handler.
  * Handles the lifecycle of a file job: downloading, processing, uploading,
@@ -287,9 +350,10 @@ export async function handleJob(job: FileJob, bullJob?: any) {
    * Prevents hidden temp files and debugging issues
    */
   const tempDir = path.join(config.tempDir, job.fileId);
-  const inputPath = path.join(tempDir, 'input');
+  const rawInputPath = path.join(tempDir, 'input');
   const outputBase = path.join(tempDir, 'output');
   const lockKey = REDIS_KEYS.LOCK(job.fileId);
+  const jobKey = REDIS_KEYS.JOB(job.fileId);
   /**
    * IDEMPOTENCY LOCK (CRITICAL)
    * Prevent duplicate execution
@@ -310,259 +374,294 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   }
 
   console.log(`LOCK ACQUIRED: ${job.fileId} by ${WORKER_ID}`);
-
-  //  #region admission control lock
-  // /**
-  //  * STEP 2: Admission control (CRITICAL)
-  //  */
-  // const type = getType(job.size);
-
-  // const acquired = await acquire(type);
-
-  // if (!acquired) {
-  //   const retries = job.retryCount || 0;
-
-  //   if (retries > 3) {
-  //     await updateJobStage(job.fileId, JOB_STATUS.FAILED, 'admission_failed', {
-  //       error: 'Admission limit exceeded',
-  //     });
-  //     return;
-  //   }
-
-  //   await new Promise(r => setTimeout(r, 2000));
-
-  //   await enqueueFile({
-  //     ...job,
-  //     retryCount: retries + 1,
-  //   });
-
-  //   return;
-  // }
-  // # endregion
-  /**
-   * PER-USER LIMIT
-   */
   const userKey = USER_ACTIVE_KEY(job.userTier); // TODO: (you should use userId later)
-  const active = Number(await connection.get(userKey) || 0);
-
-  if (active >= MAX_ACTIVE_PER_USER) {
-    throw new Error('User concurrency limit reached');
-  }
-
-  await connection.incr(userKey);
-  await connection.expire(userKey, 3600);
-
-  /**
-   * Acquire global CPU slot BEFORE heavy work begins
-   */
-  await acquireCpuSlot();
-
-  /**
-   * STEP 3: Prepare temp dir BEFORE download
-   */
-  await fs.promises.mkdir(tempDir, { recursive: true });
-
-  /**
-   * STEP 4: Download AFTER admission (FIXED)
-   */
-  await download(job.inputUrl, inputPath);
-
-  /**
-   * Remux MKV → MP4 container (no re-encode)
-   * Prevents timestamp / stream issues
-   */
-  let safeInput = inputPath;
-
-  if (job.fileType === FILE_TYPE.VIDEO && inputPath.endsWith('.mkv')) {
-    const remuxed = path.join(tempDir, 'remux.mp4');
-
-    await new Promise((res, rej) => {
-      const ff = spawn(config.ffmpegPath, [
-        '-y',
-        '-i', inputPath,
-        '-c', 'copy',
-        remuxed,
-      ]);
-
-      ff.on('close', (c) => (c === 0 ? res(null) : rej()));
-      ff.on('error', rej);
-    });
-
-    safeInput = remuxed;
-  }
-
-  /**
-   * Calculate required disk:
-   * - 2x file size (input + output)
-   * - minimum 500MB safety buffer
-   */
-  const REQUIRED_DISK = Math.max(job.size * 2, 500 * 1024 * 1024);
-
-  /**
-   * Persist exact reservation value.
-   * CRITICAL: This must be used during release to prevent drift.
-   */
-  await connection.hset(REDIS_KEYS.JOB(job.fileId), {
-    reservedDisk: REQUIRED_DISK
-  });
-
-  /**
-   * Attempt to reserve disk atomically
-   */
-  const reserved = await reserveDisk(REQUIRED_DISK);
-
-  if (!reserved) {
-    throw new Error('Global disk reservation failed (insufficient space)');
-  }
-
-  /**
-   * STEP 5: Compute accurate TTL AFTER download
-   */
-  let ttl = computeFileTTL(job.size);
-
-  if (job.fileType === FILE_TYPE.VIDEO) {
-    /**
-     * SAFELY extract duration (MKV-safe)
-     */
-    let duration = 5 * 60 * 1000; // fallback 5 min
-
-    try {
-      duration = getDuration(safeInput);
-    } catch (err) {
-      console.warn('FFPROBE FAILED, using fallback duration:', job.fileId);
-    }
-
-    ttl = computeVideoTTL(duration);
-  }
-
-  await connection.pexpire(lockKey, Math.max(ttl, LOCK_TTL));
-  /**
-   * Ensure job has initial state without overwriting enqueue metadata
-   */
-  await connection.hset(REDIS_KEYS.JOB(job.fileId), {
-    status: JOB_STATUS.PROCESSING,
-    stage: JOB_STAGE.STARTING,
-    startedAt: Date.now(),
-  });
-
   const startTime = Date.now();
-
-  // HEARTBEAT
-  const heartbeat = setInterval(async () => {
-    try {
-      const owner = await connection.get(lockKey);
-
-      if (owner === WORKER_ID) {
-        await connection.pexpire(lockKey, LOCK_TTL);
-      } else {
-        console.warn(`Lost lock ownership for ${job.fileId}`);
-        clearInterval(heartbeat);
-      }
-    } catch (err) {
-      console.error('Heartbeat error:', err);
-    }
-  }, 60_000);
-
-
-  // #region Uncomment this for admission to handle slot allocation.
-  // // Step 0: Acquire a processing slot based on job type
-  // const acquired = await acquire(type);
-  // if (!acquired) {
-  //   const retries = job.retryCount || 0;
-
-  //   if (retries > 3) {
-  //     await updateJobStage(job.fileId, 'failed', 'admission_failed', {
-  //       error: 'Admission limit exceeded',
-  //     });
-  //     return;
-  //   }
-
-  //   await new Promise(r => setTimeout(r, 2000));
-
-  //   await enqueueFile({
-  //     ...job,
-  //     retryCount: retries + 1,
-  //   });
-
-  //   return;
-  // }
-  // #endregion
-
+  let heartbeat: NodeJS.Timeout | null = null;
+  let userSlotAcquired = false;
+  let diskReserved = false;
+  let reservedDisk = 0;
+  let cpuSlotHeld = false;
   let outputPath = '';
-
+  let safeInput = rawInputPath;
+  let videoDurationMs: number | null = null;
+  let previewReady = false;
   let jobStatus: JobStatus = JOB_STATUS.PROCESSING;
 
+  const acquireLocalCpuSlot = async () => {
+    if (cpuSlotHeld) return;
+    await acquireCpuSlot();
+    cpuSlotHeld = true;
+  };
+
+  const releaseLocalCpuSlot = async () => {
+    if (!cpuSlotHeld) return;
+    await releaseCpuSlot();
+    cpuSlotHeld = false;
+  };
+
+  const withCpuSlot = async <T>(task: () => Promise<T>): Promise<T> => {
+    await acquireLocalCpuSlot();
+    try {
+      return await task();
+    } finally {
+      await releaseLocalCpuSlot();
+    }
+  };
+
   try {
+    /**
+     * PER-USER LIMIT
+     */
+    const active = Number(await connection.get(userKey) || 0);
+
+    if (active >= MAX_ACTIVE_PER_USER) {
+      throw new Error('User concurrency limit reached');
+    }
+
+    await connection.incr(userKey);
+    await connection.expire(userKey, 3600);
+    userSlotAcquired = true;
+
+    await connection.del(REDIS_KEYS.PREVIEW(job.fileId));
+    await connection.hdel(jobKey, 'previewStatus', 'previewError', 'previewKey');
+
+    /**
+     * STEP 3: Prepare temp dir BEFORE download
+     */
+    await fs.promises.mkdir(tempDir, { recursive: true });
+
+    /**
+     * Ensure job has initial state without overwriting enqueue metadata
+     */
+    await connection.hset(jobKey, {
+      status: JOB_STATUS.PROCESSING,
+      stage: JOB_STAGE.STARTING,
+      startedAt: startTime,
+    });
+
     /** Stage 1: Downloading the input file */
     await updateJobStage(job.fileId, jobStatus, JOB_STAGE.DOWNLOADING, {
       startedAt: startTime,
       bullJob,
     });
 
+    /**
+     * STEP 4: Download AFTER admission
+     */
+    await download(job.inputUrl, rawInputPath);
+
+    const materializedInput = await materializeInputPath(rawInputPath, job);
+    safeInput = materializedInput.inputPath;
+
+    /**
+     * Probe the downloaded asset so we can fail early on obviously invalid inputs
+     * and make container normalization decisions without depending on the temp filename.
+     */
+    let videoProbe:
+      | ReturnType<typeof inspectVideoInput>
+      | null = null;
+
+    if (job.fileType === FILE_TYPE.VIDEO) {
+      try {
+        videoProbe = inspectVideoInput(safeInput);
+      } catch (probeErr) {
+        console.warn('VIDEO PROBE FAILED, continuing with best effort:', job.fileId, probeErr);
+      }
+
+      if (videoProbe && !videoProbe.hasVideo) {
+        throw new Error('Input file does not contain a video stream');
+      }
+
+      /**
+       * Remux Matroska inputs when possible, but never make that a hard dependency.
+       * Some MKV files contain codecs that cannot be copied into MP4 cleanly.
+       */
+      const isMatroskaInput = isLikelyMatroska({
+        formatName: videoProbe?.formatName,
+        mime: materializedInput.detectedMime,
+        ext: materializedInput.detectedExt,
+      });
+
+      if (isMatroskaInput) {
+        const remuxed = path.join(tempDir, 'remux.mp4');
+
+        try {
+          await withCpuSlot(
+            () =>
+              new Promise<void>((resolve, reject) => {
+                const ff = spawn(config.ffmpegPath, [
+                  '-y',
+                  '-fflags', '+genpts',
+                  '-i', safeInput,
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-sn',
+                  '-dn',
+                  '-c', 'copy',
+                  remuxed,
+                ]);
+
+                ff.on('close', (code) => {
+                  if (code === 0) resolve();
+                  else reject(new Error(`MKV remux failed with code ${code}`));
+                });
+                ff.on('error', reject);
+              })
+          );
+
+          safeInput = remuxed;
+
+          try {
+            videoProbe = inspectVideoInput(safeInput);
+          } catch (probeErr) {
+            console.warn('REMUX PROBE FAILED, keeping remuxed input:', job.fileId, probeErr);
+          }
+        } catch (remuxErr) {
+          console.warn('MKV REMUX SKIPPED, falling back to direct decode:', job.fileId, remuxErr);
+        }
+      }
+    }
+
+    /**
+     * Calculate required disk:
+     * - 2x file size (input + output)
+     * - minimum 500MB safety buffer
+     */
+    reservedDisk = Math.max(job.size * 2, 500 * 1024 * 1024);
+
+    /**
+     * Persist exact reservation value.
+     * CRITICAL: This must be used during release to prevent drift.
+     */
+    await connection.hset(jobKey, {
+      reservedDisk,
+    });
+
+    /**
+     * Attempt to reserve disk atomically
+     */
+    diskReserved = await reserveDisk(reservedDisk);
+
+    if (!diskReserved) {
+      throw new Error('Global disk reservation failed (insufficient space)');
+    }
+
+    /**
+     * STEP 5: Compute accurate TTL AFTER download
+     */
+    let ttl = computeFileTTL(job.size);
+
+    if (job.fileType === FILE_TYPE.VIDEO) {
+      /**
+       * SAFELY extract duration after any container normalization
+       */
+      videoDurationMs = videoProbe?.durationMs ?? 5 * 60 * 1000;
+
+      ttl = computeVideoTTL(videoDurationMs);
+    }
+
+    await connection.pexpire(lockKey, Math.max(ttl, LOCK_TTL));
+
+    // HEARTBEAT
+    heartbeat = setInterval(async () => {
+      try {
+        const owner = await connection.get(lockKey);
+
+        if (owner === WORKER_ID) {
+          await connection.pexpire(lockKey, LOCK_TTL);
+        } else if (heartbeat) {
+          console.warn(`Lost lock ownership for ${job.fileId}`);
+          clearInterval(heartbeat);
+          heartbeat = null;
+        }
+      } catch (err) {
+        console.error('Heartbeat error:', err);
+      }
+    }, 60_000);
+
     /** Stage 2: Processing */
     await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING);
 
     if (job.fileType === FILE_TYPE.IMAGE) {
-      const result = await processImage(safeInput, outputBase);
+      const result = await withCpuSlot(() => processImage(safeInput, outputBase));
       outputPath = result.outputPath;
 
       job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
-    }
-
-    if (job.fileType === FILE_TYPE.IMAGE) {
       await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING, {
         progress: 100,
         bullJob,
       });
-    }
-    // Everything else remains as you wrote (already solid)
-
-    else if (job.fileType === FILE_TYPE.VIDEO) {
+    } else if (job.fileType === FILE_TYPE.VIDEO) {
       const previewPath = path.join(tempDir, 'preview.mp4');
+      const previewKey = buildPreviewKey(job.outputKey);
 
-    /**
-     * STEP 1: Generate preview (light CPU)
-     */
-    await generatePreviewClip(safeInput, previewPath, 8);
+      /**
+       * Preview should never block the main video pipeline.
+       * If it fails, we still complete the final encode and expose that as fallback.
+       */
+      try {
+        await withCpuSlot(() => generatePreviewClip(safeInput, previewPath, 8));
+        await upload(previewPath, previewKey);
+        await storePreviewRecord(job.fileId, {
+          kind: 'progressive',
+          key: previewKey,
+          source: 'preview',
+        });
+        await connection.hset(jobKey, {
+          previewStatus: 'ready',
+          previewKey,
+        });
+        previewReady = true;
+      } catch (previewErr: any) {
+        console.warn('PREVIEW FAILED:', job.fileId, previewErr);
+        await connection.hset(jobKey, {
+          previewStatus: 'failed',
+          previewError: previewErr?.message || 'Preview generation failed',
+        });
+      }
 
-    /**
-     * STEP 2: Upload preview immediately
-     */
-    const previewKey = `${job.outputKey}/preview.mp4`;
-    await upload(previewPath, previewKey);
+      /**
+       * STEP 3: Full processing (heavy CPU)
+       */
+      const finalOutput = `${outputBase}.mp4`;
+      let lastProgress = -1;
+      let lastProgressAt = 0;
 
-    await connection.set(
-      REDIS_KEYS.PREVIEW(job.fileId),
-      previewKey
-    );
+      await withCpuSlot(() =>
+        processVideo(
+          safeInput,
+          finalOutput,
+          videoDurationMs ? { totalDuration: videoDurationMs } : undefined,
+          (progress) => {
+            const normalized = Math.max(0, Math.min(Math.round(progress), 100));
+            const now = Date.now();
 
-    /**
-     * IMPORTANT:
-     * Release CPU after preview.
-     * Otherwise preview + full encode run inside same slot → overload.
-     */
-    await releaseCpuSlot();
+            if (normalized < 100) {
+              if (normalized <= lastProgress) return;
+              if (now - lastProgressAt < 750) return;
+            }
 
-    /**
-     * Re-acquire CPU for heavy full encode
-     */
-    await acquireCpuSlot();
+            lastProgress = normalized;
+            lastProgressAt = now;
 
-    /**
-     * STEP 3: Full processing (heavy CPU)
-     */
-    const finalOutput = `${outputBase}.mp4`;
-
-    await processVideo(safeInput, finalOutput, undefined, async (progress) => {
-        await updateJobStage(
-          job.fileId,
-          JOB_STATUS.PROCESSING,
-          JOB_STAGE.PROCESSING,
-          {
-            progress,
-            bullJob,
+            void updateJobStage(
+              job.fileId,
+              JOB_STATUS.PROCESSING,
+              JOB_STAGE.PROCESSING,
+              {
+                progress: normalized,
+                bullJob,
+              }
+            ).catch((progressErr) => {
+              console.error('Progress update failed:', progressErr);
+            });
           }
-        );
+        )
+      );
+
+      await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING, {
+        progress: 100,
+        bullJob,
       });
 
       outputPath = finalOutput;
@@ -574,6 +673,19 @@ export async function handleJob(job: FileJob, bullJob?: any) {
      * Upload final output for ALL file types (including video)
      */
     const result = await upload(outputPath, job.outputKey);
+
+    if (job.fileType === FILE_TYPE.VIDEO && !previewReady) {
+      await storePreviewRecord(job.fileId, {
+        kind: 'progressive',
+        key: job.outputKey,
+        source: 'final',
+        fallback: true,
+      });
+      await connection.hset(jobKey, {
+        previewStatus: 'fallback',
+        previewKey: job.outputKey,
+      });
+    }
 
     /** Job successfully completed */
     jobStatus = JOB_STATUS.COMPLETED;
@@ -654,34 +766,30 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     throw err;
 
   } finally {
-    // await release(type); // admission release code
-    /**
-     * Release global CPU slot
-     */
-    await releaseCpuSlot();
+    await releaseLocalCpuSlot();
 
     /**
      * Release user slot
      */
-    try {
-      const val = await connection.decr(userKey);
-      if (val <= 0) await connection.del(userKey);
-    } catch { }
+    if (userSlotAcquired) {
+      try {
+        const val = await connection.decr(userKey);
+        if (val <= 0) await connection.del(userKey);
+      } catch {
+        // swallow — cleanup must never crash worker
+      }
+    }
 
     /**
      * Release EXACT reserved disk.
      * Prevents drift between reserve/release values.
      */
-    try {
-      const reservedDisk = Number(
-        await connection.hget(REDIS_KEYS.JOB(job.fileId), 'reservedDisk') || 0
-      );
-
-      if (reservedDisk > 0) {
+    if (diskReserved && reservedDisk > 0) {
+      try {
         await releaseDisk(reservedDisk);
+      } catch {
+        // swallow — cleanup must never crash worker
       }
-    } catch {
-      // swallow — cleanup must never crash worker
     }
 
     /**
@@ -689,21 +797,16 @@ export async function handleJob(job: FileJob, bullJob?: any) {
      * - Always clean on success
      * - Keep failed temp for retry BUT limit retention
      */
-    const previewExists = await connection.get(REDIS_KEYS.PREVIEW(job.fileId));
-    if (jobStatus === JOB_STATUS.COMPLETED && previewExists) {
+    if (jobStatus === JOB_STATUS.COMPLETED) {
       await fs.promises.rm(tempDir, { recursive: true, force: true });
-    }
-    else {
+    } else {
       /**
        * Schedule delayed cleanup for failed jobs to allow for retries and debugging.
        * Prevent disk explosion
        */
       setTimeout(async () => {
         try {
-          const previewExists = await connection.get(REDIS_KEYS.PREVIEW(job.fileId));
-          if (jobStatus === JOB_STATUS.COMPLETED && previewExists) {
-            await fs.promises.rm(tempDir, { recursive: true, force: true });
-          }
+          await fs.promises.rm(tempDir, { recursive: true, force: true });
         } catch { }
       }, 1000 * 60 * 30); // 30 minutes retention
     }
@@ -717,6 +820,8 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     } catch (err) {
       console.error('Lock release error:', err);
     }
-    clearInterval(heartbeat);
+    if (heartbeat) {
+      clearInterval(heartbeat);
+    }
   }
 }
