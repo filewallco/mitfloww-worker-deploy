@@ -16,7 +16,48 @@ import { fileTypeFromFile } from 'file-type';
 import { inferExtensionFromValue, isLikelyMatroska, normalizeExtension } from '../utils/media';
 
 const USER_ACTIVE_KEY = (userId: string) => `user:${userId}:active`;
-const MAX_ACTIVE_PER_USER = 100; // TODO: make this configurable per user tier
+
+/** Maximum concurrent active jobs per user */
+const ACQUIRE_USER_SLOT_LUA = `
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+local limit = tonumber(ARGV[1])
+
+if current < limit then
+  redis.call("INCR", KEYS[1])
+  redis.call("EXPIRE", KEYS[1], 60)
+  return 1
+else
+  return 0
+end
+`;
+
+/**
+ * Acquire a user slot (blocking with retry)
+ */
+async function acquireUserSlot(userId: string, limit: number): Promise<void> {
+  while (true) {
+    const ok = await connection.eval(
+      ACQUIRE_USER_SLOT_LUA,
+      1,
+      USER_ACTIVE_KEY(userId),
+      limit
+    );
+
+    if (ok === 1) return;
+
+    await new Promise(r => setTimeout(r, 100));
+  }
+}
+
+/**
+ * Release a user slot
+ */
+async function releaseUserSlot(userId: string): Promise<void> {
+  try {
+    const val = await connection.decr(USER_ACTIVE_KEY(userId));
+    if (val <= 0) await connection.del(USER_ACTIVE_KEY(userId));
+  } catch {}
+}
 
 function getCpuLimit(): number {
   // 1. Respect explicit override
@@ -374,7 +415,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   }
 
   console.log(`LOCK ACQUIRED: ${job.fileId} by ${WORKER_ID}`);
-  const userKey = USER_ACTIVE_KEY(job.userTier); // TODO: (you should use userId later)
+  const userId = job.userId || 'local-user';
   const startTime = Date.now();
   let heartbeat: NodeJS.Timeout | null = null;
   let userSlotAcquired = false;
@@ -412,14 +453,9 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     /**
      * PER-USER LIMIT
      */
-    const active = Number(await connection.get(userKey) || 0);
+    const limit = config.userLimits[job.userTier] || 2;
 
-    if (active >= MAX_ACTIVE_PER_USER) {
-      throw new Error('User concurrency limit reached');
-    }
-
-    await connection.incr(userKey);
-    await connection.expire(userKey, 3600);
+    await acquireUserSlot(userId, limit);
     userSlotAcquired = true;
 
     await connection.del(REDIS_KEYS.PREVIEW(job.fileId));
@@ -773,8 +809,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
      */
     if (userSlotAcquired) {
       try {
-        const val = await connection.decr(userKey);
-        if (val <= 0) await connection.del(userKey);
+        await releaseUserSlot(userId);
       } catch {
         // swallow — cleanup must never crash worker
       }

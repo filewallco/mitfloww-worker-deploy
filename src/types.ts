@@ -4,22 +4,20 @@
 export interface FileJob {
   /** Unique identifier for the job/file */
   fileId: string;
-
   /** Source URL or file path */
   inputUrl: string;
-
   /** Output key / destination for processed file */
   outputKey: string;
-
   /** Type of the file */
   fileType: 'video' |'image' | 'pdf' | 'zip' | 'other';
-
   /** Size of the file in bytes */
   size: number;
-
   /** Tier of the user uploading the file */
   userTier: 'free' | 'premium' | 'vip';
-
+  /** ID of the user who uploaded the file */
+  userId: string;
+  /** Optional batch ID if the file is part of a batch upload */
+  batchId?: string;
   /** Total retry attempts across requeues */
   retryCount?: number;
 }

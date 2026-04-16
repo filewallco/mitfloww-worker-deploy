@@ -281,6 +281,8 @@ export async function recoverStuckJobs() {
           fileType: meta.fileType as any,
           size: Number(meta.size),
           userTier: meta.userTier as any,
+          userId: meta.userId || 'retry-user',
+          batchId: meta.batchId || undefined,
         });
       }
     }

@@ -411,6 +411,8 @@ export function startAdminServer() {
         fileType,
         size: size,
         userTier,
+        userId: meta.userId || 'recovered-user',
+        batchId: meta.batchId || undefined,
       });
 
       res.writeHead(200);

@@ -1,435 +1,274 @@
-# File Processing Worker (MitFloww) – README
+# MitFloww Worker System
 
-## Overview
-
-This service is a **background worker system** designed to process files (primarily videos in Phase 1) asynchronously. It handles:
-
-* File ingestion (download)
-* Processing (e.g., video compression + watermarking)
-* Upload (local or cloud/R2)
-* Status tracking (Redis-based)
-* Queueing, prioritization, retries, and concurrency control
-
-This is designed to integrate with a frontend (e.g., Next.js) where users upload files and later check job status.
+High-performance distributed file processing pipeline for images and videos.
 
 ---
 
-# Architecture
+## 🚀 Architecture Overview
 
-## High-Level Flow
-
-```
-Client (Next.js)
-      ↓
-API (enqueue job)
-      ↓
-BullMQ Queue (Redis)
-      ↓
-Workers (Fast / Standard / Heavy)
-      ↓
-Handler
-  ├── Download
-  ├── Process (FFmpeg)
-  ├── Upload (R2 / Local)
-  └── Update Status (Redis)
-      ↓
-Client polls job status
-```
+Client → API → Queue (BullMQ) → Workers → Temp FS → Processing → Upload → Cleanup  
+                                                      ↓  
+                                                   Redis  
+                                       (state + locks + limits)
 
 ---
 
-## Worker Types
+## 🧠 Core Principles
 
-| Worker         | Handles     | Concurrency |
-| -------------- | ----------- | ----------- |
-| fastWorker     | small files | 2           |
-| standardWorker | all jobs    | 3           |
-| heavyWorker    | large files | 1           |
+### Ephemeral Processing
+- Temp files are NOT storage
+- Used only during processing
+- Always cleaned after lifecycle
 
----
+### Distributed Safety
+- Idempotency locks prevent duplicate execution
+- Disk reservation prevents overuse
+- CPU limiter prevents overload
+- Per-user limits ensure fairness
 
-## Scheduling Strategy
-
-* **Priority Queue (BullMQ)**
-* Based on:
-
-  * User tier (VIP > Premium > Free)
-  * File size (Small > Medium > Large)
-* **Retries with exponential backoff**
-* **Admission control (Redis-based concurrency limits)**
-
----
-
-# Core Components
-
-## 1. Queue (BullMQ)
-
-* Manages job lifecycle
-* Supports:
-
-  * Priority
-  * Retries
-  * Delayed execution
-
-### Why BullMQ?
-
-* Reliable job processing
-* Redis-backed durability
-* Built-in retry + backoff
-* Horizontal scalability
+### Fault Tolerance
+- Automatic retries
+- Poison job detection
+- Dead Letter Queue (DLQ)
+- Stuck job recovery
 
 ---
 
-## 2. Redis (ioredis)
+## 📦 Job Lifecycle
 
-Used for:
-
-* Queue backend
-* Job metadata storage
-* Admission control (distributed concurrency limits)
-
-### Why Redis?
-
-* Extremely fast
-* Atomic operations (Lua scripts)
-* Perfect for ephemeral job state
+QUEUED → DOWNLOADING → PROCESSING → UPLOADING → COMPLETED  
+                                                ↓  
+                                        FAILED / RETRYING
 
 ---
 
-## 3. FFmpeg
+## ⚙️ Queues
 
-Used for:
+- small-files
+- medium-files
+- large-files
+- image-files
 
-* Video processing
-* Compression
-* Watermarking
-
-### Why FFmpeg?
-
-* Industry standard
-* Highly optimized
-* Supports all major formats
-
----
-
-## 4. Worker Handler
-
-Core execution pipeline:
-
-```
-acquire slot → download → process → upload → update status → release slot
-```
-
-Responsibilities:
-
-* Admission control
-* Temp file management
-* Error handling
-* Status updates
+### Features
+- Priority-based scheduling
+- Aging to prevent starvation
+- Size-based routing
+- Tier-based priority
 
 ---
 
-## 5. Admission Control
+## 👷 Workers
 
-Located in:
+| Worker   | Purpose       | Concurrency |
+|----------|--------------|------------|
+| Fast     | Small files   | High       |
+| Standard | Medium files  | Moderate   |
+| Heavy    | Large files   | 1          |
+| Image    | Images        | High       |
 
-```
-src/worker/admission.ts
-```
+Configured via environment variables:
+- FAST_CONCURRENCY
+- MEDIUM_CONCURRENCY
+- HEAVY_CONCURRENCY
+- IMAGE_CONCURRENCY
 
-Purpose:
+---
 
-* Prevent system overload
-* Limit concurrent jobs per size category
+## 🎬 Processing Pipeline
+
+### Image Processing
+- Resize (max 1024px)
+- Watermark overlay
+- Format optimization (webp/png/jpeg)
+- Animated support
+
+### Video Processing
+- FFmpeg-based pipeline
+- Scale to 360p
+- Watermark overlay
+- H.264 encoding
+- Preview clip generation (8s)
+
+---
+
+## ⚡ Resource Management
+
+### CPU Control
+- Redis-based global semaphore
+- Prevents CPU overload
+
+### Disk Reservation
+- Atomic reservation before processing
+- Prevents disk exhaustion mid-job
+
+Logic:
+- If (free - reserved >= required) → allow
+- Else → reject job
+
+### Upload Throttling
+- Global upload slot limiter
+- Prevents I/O congestion
+
+### Per-User Limits
+
+- Free: 2 concurrent jobs  
+- Premium: 4 concurrent jobs  
+- VIP: 6 concurrent jobs  
+
+---
+
+## 📁 Temp Storage Strategy
+
+### Structure
+/tmp/{jobId}/
+
+Contains:
+- Input file
+- Intermediate files
+- Output file
+
+---
+
+### Cleanup Policy
+
+#### Success
+- Deleted immediately
+
+#### Failure
+- Retained for 30 minutes
+- Then auto-deleted
+
+#### Global Cleanup
+- Runs every 60 seconds
+- Deletes oldest temp folders
+- Triggered when disk is low
+
+---
+
+### Important
+
+Temp is:
+- Ephemeral workspace
+- NOT persistent storage
+
+---
+
+## 🔁 Retry System
+
+### Levels
+
+1. BullMQ retries  
+   - Exponential backoff  
+
+2. Custom requeue  
+   - Based on file size  
+   - Max total retries: 5  
+
+3. Poison job detection  
+   - Stops retry if same error repeats  
+
+---
+
+## 🧑‍💻 Per-User Fairness System
+
+- Each job includes userId
+- Redis-based atomic concurrency control
+- Ensures no user can monopolize workers
+
+Behavior:
+- Bulk uploads are rate-limited per user
+- Other users are never blocked
+
+---
+
+## ⚙️ Environment Configuration
 
 Example:
-
 ```
-small  → 5 concurrent
-medium → 3 concurrent
-large  → 1 concurrent
-```
+MODE=local  
 
-Uses Redis + Lua for atomicity.
+REDIS_HOST=127.0.0.1  
+REDIS_PORT=6379  
 
----
+FFMPEG_PATH=ffmpeg  
+FFMPEG_MAX_THREADS=2  
+MAX_PARALLEL_UPLOADS=3  
 
-## 6. Job Status Tracking
+OUTPUT_DIR=./outputs  
 
-Stored in Redis:
+FAST_CONCURRENCY=5  
+MEDIUM_CONCURRENCY=3  
+HEAVY_CONCURRENCY=1  
+IMAGE_CONCURRENCY=15  
 
-```
-job:{fileId}
-```
+RATE_LIMIT_MAX=10  
+RATE_LIMIT_DURATION=1000  
 
-Example fields:
+MIN_FREE_DISK=5368709120  
+TARGET_FREE_DISK=10737418240  
 
-```
-status: queued | processing | completed | failed | retrying
-stage: downloading | processing | uploading | done
-progress: number
-output: file URL/path
-duration: ms
-error: message
+PORT=4000  
+WS_PORT=4001  
 ```
 
 ---
 
-## Project Structure
 
-```
-src/
-├── processors/
-│   └── video.ts        # FFmpeg processing
-│
-├── queue/
-│   ├── connection.ts   # Redis connection
-│   ├── enqueue.ts      # Add jobs
-│   └── queues.ts       # BullMQ queue
-│
-├── worker/
-│   ├── admission.ts    # Concurrency control
-│   ├── handler.ts      # Core job execution
-│   ├── fastWorker.ts
-│   ├── standardWorker.ts
-│   └── heavyWorker.ts
-│
-├── utils/
-│   └── r2.ts           # Download/upload logic
-│
-├── server/
-│   └── jobStatus.ts    # Fetch job status
-│
-├── localTest.ts        # Local testing runner
-├── config.ts           # Centralized configuration
-├── types.ts            # Structure of file processing
-└── index.ts            # Entry point
-```
+## 🧪 Local Testing
 
----
-
-# Setup & Requirements
-
-## 1. System Requirements
-
-* Node.js (>= 18)
-* Redis server
-* FFmpeg installed
-
-### Install FFmpeg
-
-**Ubuntu**
-
-```
-sudo apt install ffmpeg
-```
-
-**Mac**
-
-```
-brew install ffmpeg
-```
-
----
-
-## 2. Install Dependencies
-
-```
-pnpm install
-```
-
----
-
-## 3. Environment Variables
-
-Create `.env.local`:
-
-```
-MODE=local
-
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-
-FFMPEG_PATH=ffmpeg
-
-OUTPUT_DIR=./outputs
-```
-
----
-
-## 4. Start Redis
-
-```
-redis-server
-```
-
----
-
-## 5. Run Worker
-
-```
-pnpm run dev
-```
-
----
-
-## 6. Local Testing
-
-Place files inside:
-
-```
-/test-files
-```
-
-Then run:
-
-```
-pnpm run dev
-```
-
----
-
-# How It Works (Step-by-Step)
-
-### 1. Enqueue Job
-
-```
-enqueueFile(job)
-```
-
-* Stores initial status in Redis
-* Adds job to BullMQ
-
----
-
-### 2. Worker Picks Job
-
-* Based on type (small/medium/large)
-* Runs `handleJob`
-
----
-
-### 3. Admission Control
-
-```
-acquire(type)
-```
-
-* Prevents overload
-* If full → job retries
-
----
-
-### 4. Processing Pipeline
-
-```
-download → processVideo → upload
-```
-
----
-
-### 5. Status Updates
-
-Stored continuously in Redis:
-
-* Real-time progress
-* Stage updates
-* Errors
-
----
-
-### 6. Completion
-
-* Output stored (local path or URL)
-* Temp files deleted
-
----
-
-# API Integration (Frontend)
-
-Use:
-
-```
-getJobStatus(jobId)
-```
-
-Returns:
-
-```
-{
-  queueState,
-  progress,
-  meta: {
-    status,
-    stage,
-    output,
-    duration,
-    error
-  }
-}
-```
-
-Frontend should:
-
-* Poll every 2–5 seconds
-* Display progress/status
-* Show download link on completion
-
----
-
-# Phase 1 Scope
-
-### Supported
-
-* Video processing
-* Watermarking (FFmpeg)
-* Local + mock cloud upload
-* Queue + retries
-* Status tracking
-
-### Not Included Yet
-
-* Real R2/S3 upload
-* DB persistence (Redis only)
-* Multi-region scaling
-* Advanced scheduling
-
----
-
-## To run the server
-
-***Start Docker***
+### Start Redis (Docker)
 
 ```bash
-docker run -d -p 6379:6379 --name mitfloww-redis redis
-docker stop mitfloww-redis
-docker start mitfloww-redis
+docker run -d -p 6379:6379 --name mitfloww-redis redis  
+docker stop mitfloww-redis  
+docker start mitfloww-redis  
 ```
+---
 
-***Run node server***
+### Run Worker Server
 
-```bash
-pnpm ts-node src/index.ts
-```
+pnpm ts-node src/index.ts  
 
 ---
 
-## Usefull docker commands
+### Notes
 
-***Verify docker running***
+- Use local files with:
+  file://absolute/path/to/file
 
-```bash
-docker ps
-```
+- Default test values:
+  - userId: local-user
+  - batchId: local-batch
 
-***To remove container***
-
-```bash
-docker rm <container_id>
-```
-
-***Build and run***
-```bash
-docker-compose up --build
-```
 ---
+
+## ⚠️ Key Guarantees
+
+- No duplicate job execution  
+- No disk overcommit  
+- No CPU overload  
+- Fair usage across users  
+- Automatic recovery from failures  
+
+---
+
+## 🚀 Future Improvements
+
+- Batch progress tracking  
+- Adaptive scheduling (dynamic priority)  
+- Smarter retry classification  
+- Distributed tracing  
+- AI-based moderation (optional)  
+
+---
+
+## 🧭 Summary
+
+This system is designed for:
+
+- High reliability  
+- Fair resource distribution  
+- Efficient media processing  
+- Horizontal scalability  
+
+Temp storage is controlled, failures are handled, and no single user can degrade system performance.

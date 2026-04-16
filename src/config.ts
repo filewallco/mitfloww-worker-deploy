@@ -1,5 +1,4 @@
 import path from 'path';
-import os from 'os';
 import fs from 'fs';
 
 /**
@@ -67,6 +66,13 @@ export const config = {
   disk: {
     minFreeBytes: Number(process.env.MIN_FREE_DISK || 5 * 1024 * 1024 * 1024), // 5GB
     targetFreeBytes: Number(process.env.TARGET_FREE_DISK || 10 * 1024 * 1024 * 1024), // 10GB
+  },
+
+  /** User tier limits for concurrent processing */
+  userLimits: {
+    free: Number(process.env.USER_LIMIT_FREE || 2),
+    premium: Number(process.env.USER_LIMIT_PREMIUM || 4),
+    vip: Number(process.env.USER_LIMIT_VIP || 6),
   },
 };
 

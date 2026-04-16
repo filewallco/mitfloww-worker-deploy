@@ -48,6 +48,8 @@ export async function enqueueFile(job: FileJob) {
       userTier: job.userTier,
       progress: 0,
       retryCount,
+      userId: job.userId,
+      batchId: job.batchId || null,
       queueName:
         sizeType === 'small'
           ? QUEUE_NAME.SMALL

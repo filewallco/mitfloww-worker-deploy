@@ -78,6 +78,8 @@ async function enqueueSafe(file: string) {
     fileType,
     size: stats.size,
     userTier: 'free',
+    userId: 'local-user',
+    batchId: 'local-batch',
   };
   console.log(`ENQUEUE CALLED: ${file}`);
   await enqueueFile(job);
