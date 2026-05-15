@@ -2,6 +2,7 @@ import { execFileSync, spawn } from 'child_process';
 import path from 'path';
 import { config } from '../config';
 import os from 'os';
+import { createFfmpegStderrBuffer, logger } from '../utils/logger';
 
 type FfprobeStream = {
   codec_type?: string;
@@ -34,6 +35,25 @@ export type VideoProbe = {
   height: number | null;
 };
 
+const ALLOWED_VIDEO_CODECS = new Set([
+  'h264',
+  'hevc',
+  'vp8',
+  'vp9',
+  'av1',
+  'mpeg4',
+  'mjpeg'
+]);
+const ALLOWED_AUDIO_CODECS = new Set([
+  'aac',
+  'mp3',
+  'opus',
+  'vorbis',
+  'pcm_s16le',
+  'ac3',
+  'eac3'
+]);
+
 /**
  * Compute FFmpeg thread allocation.
  * Strategy:
@@ -52,6 +72,15 @@ function clampProgress(value: number): number {
   return Math.max(0, Math.min(value, 100));
 }
 
+const FFPROBE_PROTOCOL_ARGS = [
+  '-protocol_whitelist',
+  'file,pipe,data'
+];
+const LOCAL_INPUT_ARGS = [
+  '-protocol_whitelist',
+  'file,pipe,data'
+];
+
 function runFfprobe(file: string): FfprobePayload {
   const out = execFileSync(config.ffprobePath, [
     '-v',
@@ -60,6 +89,7 @@ function runFfprobe(file: string): FfprobePayload {
     'format=format_name,duration:stream=codec_type,codec_name,width,height,disposition',
     '-of',
     'json',
+    ...FFPROBE_PROTOCOL_ARGS,
     file,
   ]);
 
@@ -75,6 +105,19 @@ function pickPrimaryStream(
   if (matches.length === 0) return undefined;
 
   return matches.find((stream) => stream.disposition?.default === 1) ?? matches[0];
+}
+
+export function assertAllowedVideoProbe(probe: VideoProbe): void {
+  const videoCodec = probe.videoCodec?.toLowerCase() ?? null;
+  const audioCodec = probe.audioCodec?.toLowerCase() ?? null;
+
+  if (!videoCodec || !ALLOWED_VIDEO_CODECS.has(videoCodec)) {
+    throw new Error(`Unsupported video codec: ${probe.videoCodec || 'unknown'}`);
+  }
+
+  if (probe.hasAudio && (!audioCodec || !ALLOWED_AUDIO_CODECS.has(audioCodec))) {
+    throw new Error(`Unsupported audio codec: ${probe.audioCodec || 'unknown'}`);
+  }
 }
 
 export function inspectVideoInput(file: string): VideoProbe {
@@ -122,6 +165,7 @@ export function processVideo(
     totalDuration?: number; // FULL video duration (important)
     progressOffset?: number; // where this chunk starts in %
     progressScale?: number;  // how much % this chunk contributes
+    jobId?: string; // optional job id for better diagnostics
   },
   onProgress?: (progress: number) => void
 ): Promise<void> {
@@ -130,12 +174,15 @@ export function processVideo(
 
     const args = [
       '-y',
+      '-nostdin',
 
       // FAST SEEK (important for large videos)
       ...(options?.start ? ['-ss', String(options.start)] : []),
 
+      ...LOCAL_INPUT_ARGS,
       '-fflags', '+genpts',
       '-i', input,
+      ...LOCAL_INPUT_ARGS,
       '-i', watermark,
 
       ...(options?.duration ? ['-t', String(options.duration)] : []),
@@ -159,8 +206,9 @@ export function processVideo(
     const ffmpeg = spawn(config.ffmpegPath, args);
 
     let lastProgressTime = Date.now();
-    let buffer = '';
+    let progressBuffer = '';
     let finished = false;
+    const stderrBuffer = createFfmpegStderrBuffer(50);
 
     function cleanup() {
       clearInterval(stallCheck);
@@ -182,14 +230,18 @@ export function processVideo(
     }
 
     ffmpeg.stderr.on('data', (data) => {
-      console.error('[FFMPEG]', data.toString());
-      buffer += data.toString();
+      const str = data.toString();
+      // preserve progress data separately
+      progressBuffer += str;
 
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      const lines = progressBuffer.split('\n');
+      progressBuffer = lines.pop() || '';
 
       for (const line of lines) {
-        if (line.startsWith('out_time_ms=')) {
+        // track non-progress stderr lines in rolling buffer
+        if (!line.startsWith('out_time_ms=')) {
+          stderrBuffer.push(line);
+        } else {
           lastProgressTime = Date.now();
 
           if (onProgress) {
@@ -220,8 +272,10 @@ export function processVideo(
       const STALL_LIMIT = 5 * 60 * 1000;
 
       if (Date.now() - lastProgressTime > STALL_LIMIT) {
+        const err = new Error('FFmpeg stalled');
+        logger.error('FFmpeg stalled', { jobId: options?.jobId, input, output, lastStderr: stderrBuffer.getLines() });
         ffmpeg.kill('SIGKILL');
-        safeReject(new Error('FFmpeg stalled'));
+        safeReject(err);
       }
     }, 60_000);
 
@@ -229,16 +283,24 @@ export function processVideo(
     const MAX_RUNTIME = 6 * 60 * 60 * 1000;
 
     const hardTimeout = setTimeout(() => {
+      const err = new Error('FFmpeg max runtime exceeded');
+      logger.error('FFmpeg max runtime exceeded', { jobId: options?.jobId, input, output, lastStderr: stderrBuffer.getLines() });
       ffmpeg.kill('SIGKILL');
-      safeReject(new Error('FFmpeg max runtime exceeded'));
+      safeReject(err);
     }, MAX_RUNTIME);
 
     ffmpeg.on('close', (code) => {
       if (code === 0) safeResolve();
-      else safeReject(new Error(`FFmpeg failed with code ${code}`));
+      else {
+        logger.error('FFmpeg failed', { jobId: options?.jobId, exitCode: code, input, output, lastStderr: stderrBuffer.getLines() });
+        safeReject(new Error(`FFmpeg failed with code ${code}`));
+      }
     });
 
-    ffmpeg.on('error', safeReject);
+    ffmpeg.on('error', (err) => {
+      logger.error('FFmpeg spawn error', { jobId: options?.jobId, error: err, input, output, lastStderr: stderrBuffer.getLines() });
+      safeReject(err);
+    });
   });
 }
 
@@ -254,6 +316,8 @@ export function generatePreviewClip(
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn(config.ffmpegPath, [
       '-y',
+      '-nostdin',
+      ...LOCAL_INPUT_ARGS,
       '-fflags', '+genpts',
       '-i', input,
       '-map', '0:v:0',

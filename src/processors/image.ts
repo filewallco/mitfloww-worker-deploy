@@ -1,5 +1,6 @@
 import sharp from 'sharp';
 import path from 'path';
+import { config } from '../config';
 
 type ImageOutputPlan = {
   ext: string;
@@ -74,11 +75,20 @@ export async function processImage(
     '../../assets/watermark.png'
   );
 
-  const probe = sharp(input, { animated: true });
+  const probe = sharp(input, {
+    animated: true,
+    limitInputPixels: config.security.maxImagePixels,
+  });
   const metadata = await probe.metadata();
+  const totalPixels = (metadata.width || 0) * (metadata.height || 0) * (metadata.pages || 1);
+
+  if (totalPixels > config.security.maxImagePixels) {
+    throw new Error('Image exceeds pixel limit');
+  }
 
   const image = sharp(input, {
     animated: (metadata.pages || 1) > 1,
+    limitInputPixels: config.security.maxImagePixels,
   }).rotate();
 
   const targetWidth = Math.min(metadata.width || 1024, 1024);

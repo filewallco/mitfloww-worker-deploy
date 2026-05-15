@@ -206,9 +206,18 @@ RATE_LIMIT_DURATION=1000
 
 MIN_FREE_DISK=5368709120  
 TARGET_FREE_DISK=10737418240  
+MAX_UPLOAD_BYTES=5368709120
+MAX_OUTPUT_BYTES=5368709120
+MAX_IMAGE_PIXELS=50000000
+MAX_PDF_BYTES=104857600
+MAX_PDF_PAGES=100
+MAX_PDF_PAGE_DIMENSION=14400
+PDF_PROCESSING_TIMEOUT_MS=60000
 
 PORT=4000  
 WS_PORT=4001  
+ADMIN_TOKEN=
+WS_TOKEN=
 ```
 
 ---
@@ -223,6 +232,11 @@ docker run -d -p 6379:6379 --name mitfloww-redis redis
 docker stop mitfloww-redis  
 docker start mitfloww-redis  
 ```
+
+### Worker Container Hardening
+
+Run production worker containers with `--read-only`, `--cap-drop=ALL`, `--security-opt=no-new-privileges`, `--pids-limit`, explicit `--memory` / `--cpus`, writable mounts only for temp/output paths, and admin/WS ports on a private network.
+
 ---
 
 ### Run Worker Server

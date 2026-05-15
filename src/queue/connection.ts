@@ -1,5 +1,6 @@
 import IORedis from 'ioredis';
 import { config } from '../config';
+import { logger } from '../utils/logger';
 
 /**
  * Redis connection instance using ioredis.
@@ -15,20 +16,20 @@ export const connection = new IORedis({
 
   retryStrategy(times) {
     const delay = Math.min(times * 100, 3000);
-    console.warn(`Redis retry attempt ${times}, delay ${delay}ms`);
+    logger.warn('Redis retry attempt', { attempt: times, delay });
     return delay;
   },
 
   reconnectOnError(err) {
-    console.error('Redis reconnect on error:', err.message);
+    logger.error('Redis reconnect on error', { message: err.message });
     return true;
   }
 });
 
 connection.on('error', (err) => {
-  console.error('Redis error:', err);
+  logger.error('Redis error', { error: err });
 });
 
 connection.on('connect', () => {
-  console.log('Redis connected');
+  logger.info('Redis connected');
 });

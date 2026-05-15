@@ -1,11 +1,17 @@
 import { WebSocketServer } from 'ws';
 import { getSystemSnapshot } from './admin';
+import { isWebSocketRequestAuthorized } from '../security/auth';
 
 /**
  * WebSocket server for real-time updates
  */
 export function startWS() {
-  const wss = new WebSocketServer({ port: 4001 });
+  const wss = new WebSocketServer({
+    port: 4001,
+    verifyClient: ({ req }, done) => {
+      done(isWebSocketRequestAuthorized(req), 401, 'Unauthorized');
+    },
+  });
 
   setInterval(async () => {
     const data = JSON.stringify(await getSystemSnapshot());

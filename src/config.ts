@@ -68,6 +68,21 @@ export const config = {
     targetFreeBytes: Number(process.env.TARGET_FREE_DISK || 10 * 1024 * 1024 * 1024), // 10GB
   },
 
+  /** Security limits */
+  security: {
+    maxUploadBytes: Number(process.env.MAX_UPLOAD_BYTES || 5 * 1024 * 1024 * 1024), // 5GB
+    maxOutputBytes: Number(process.env.MAX_OUTPUT_BYTES || 5 * 1024 * 1024 * 1024), // 5GB
+    maxImagePixels: Number(process.env.MAX_IMAGE_PIXELS || 50_000_000),
+    maxPdfBytes: Number(process.env.MAX_PDF_BYTES || 100 * 1024 * 1024), // 100MB
+    maxPdfPages: Number(process.env.MAX_PDF_PAGES || 100),
+    maxPdfPageDimension: Number(process.env.MAX_PDF_PAGE_DIMENSION || 14_400),
+    pdfProcessingTimeoutMs: Number(process.env.PDF_PROCESSING_TIMEOUT_MS || 60_000),
+  },
+
+  /** Privileged endpoint tokens */
+  adminToken: process.env.ADMIN_TOKEN || '',
+  wsToken: process.env.WS_TOKEN || process.env.ADMIN_TOKEN || '',
+
   /** User tier limits for concurrent processing */
   userLimits: {
     free: Number(process.env.USER_LIMIT_FREE || 2),

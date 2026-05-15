@@ -43,7 +43,9 @@ async function rebalanceQueue(queue: any) {
        * - Do not crash scheduler
        * - Log for observability
        */
-      console.error('Priority update failed', job.id, err);
+      // Import logger lazily to avoid circular deps in some environments
+      const { logger } = await import('../utils/logger');
+      logger.error('Priority update failed', { jobId: job.id, error: err });
     }
   }
 }

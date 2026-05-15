@@ -104,8 +104,10 @@ export async function getSystemSnapshot() {
           ? smallQueue
           : job.queueName === QUEUE_NAME.MEDIUM
             ? mediumQueue
-            : largeQueue;
-
+            : job.queueName === QUEUE_NAME.IMAGE
+              ? imageQueue
+              : largeQueue;
+      
       const waitingJobs = await queueRef.getWaiting();
 
       const index = waitingJobs.findIndex(j => j.id === job.id);

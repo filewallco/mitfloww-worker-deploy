@@ -6,16 +6,22 @@ import fs from 'fs';
 import os from 'os';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
-import { generatePreviewClip, inspectVideoInput, processVideo } from '../processors/video';
+import { assertAllowedVideoProbe, generatePreviewClip, inspectVideoInput, processVideo } from '../processors/video';
 import { getFreeDiskSpace } from '../utils/disk';
 import { config } from '../config';
 import { processImage } from '../processors/image';
+import { processPdf } from '../processors/pdf';
 import { spawn } from 'child_process';
 import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
+import { logger } from '../utils/logger';
 import { fileTypeFromFile } from 'file-type';
-import { inferExtensionFromValue, isLikelyMatroska, normalizeExtension } from '../utils/media';
+import { assertAllowedMediaInput, assertDetectedMediaMatchesDeclaration, isLikelyMatroska, normalizeExtension } from '../utils/media';
+import { assertBasicFileHeader } from '../utils/fileSignature';
+import { toPublicErrorMessage } from '../security/errors';
 
 const USER_ACTIVE_KEY = (userId: string) => `user:${userId}:active`;
+const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const LOCAL_PROTOCOL_ARGS = ['-safe', '1', '-protocol_whitelist', 'file,pipe'];
 
 /** Maximum concurrent active jobs per user */
 const ACQUIRE_USER_SLOT_LUA = `
@@ -36,14 +42,27 @@ end
  */
 async function acquireUserSlot(userId: string, limit: number): Promise<void> {
   while (true) {
-    const ok = await connection.eval(
-      ACQUIRE_USER_SLOT_LUA,
-      1,
-      USER_ACTIVE_KEY(userId),
-      limit
-    );
+    try {
+      const ok = await connection.eval(
+        ACQUIRE_USER_SLOT_LUA,
+        1,
+        USER_ACTIVE_KEY(userId),
+        limit
+      );
 
-    if (ok === 1) return;
+      if (ok === 1) return;
+    } catch (e: any) {
+      const msg = e?.message || '';
+      logger.error('acquireUserSlot Redis error', { key: USER_ACTIVE_KEY(userId), error: e });
+      if (msg.includes('not an integer') || msg.includes('out of range')) {
+        try {
+          logger.warn('Resetting user active key to 0 due to invalid value', { key: USER_ACTIVE_KEY(userId) });
+          await connection.set(USER_ACTIVE_KEY(userId), '0');
+        } catch (e2) {
+          logger.error('Failed to reset user active key', { key: USER_ACTIVE_KEY(userId), error: e2 });
+        }
+      }
+    }
 
     await new Promise(r => setTimeout(r, 100));
   }
@@ -114,14 +133,27 @@ end
  */
 async function acquireCpuSlot(): Promise<void> {
   while (true) {
-    const ok = await connection.eval(
-      ACQUIRE_CPU_LUA,
-      1,
-      CPU_KEY,
-      GLOBAL_CPU_LIMIT
-    );
+    try {
+      const ok = await connection.eval(
+        ACQUIRE_CPU_LUA,
+        1,
+        CPU_KEY,
+        GLOBAL_CPU_LIMIT
+      );
 
-    if (ok === 1) return;
+      if (ok === 1) return;
+    } catch (e: any) {
+      const msg = e?.message || '';
+      logger.error('acquireCpuSlot Redis error', { key: CPU_KEY, error: e });
+      if (msg.includes('not an integer') || msg.includes('out of range')) {
+        try {
+          logger.warn('Resetting CPU key to 0 due to invalid value', { key: CPU_KEY });
+          await connection.set(CPU_KEY, '0');
+        } catch (e2) {
+          logger.error('Failed to reset CPU key', { key: CPU_KEY, error: e2 });
+        }
+      }
+    }
 
     await new Promise(r => setTimeout(r, 100));
   }
@@ -168,15 +200,41 @@ end
  */
 async function reserveDisk(bytes: number): Promise<boolean> {
   const free = getFreeDiskSpace();
-  const ok = await connection.eval(
-    RESERVE_DISK_LUA,
-    1,
-    DISK_KEY,
-    free,
-    bytes
-  );
+  try {
+    const ok = await connection.eval(
+      RESERVE_DISK_LUA,
+      1,
+      DISK_KEY,
+      free,
+      bytes
+    );
 
-  return ok === 1;
+    return ok === 1;
+  } catch (e: any) {
+    // Recover from corrupted numeric value in Redis (e.g., non-integer stored)
+    const msg = e?.message || '';
+    logger.error('Redis error during reserveDisk', { error: e, free, bytes });
+
+    if (msg.includes('not an integer') || msg.includes('out of range')) {
+      try {
+        logger.warn('Resetting disk reservation key to 0 to recover from invalid value', { key: DISK_KEY });
+        await connection.set(DISK_KEY, '0');
+        const ok2 = await connection.eval(
+          RESERVE_DISK_LUA,
+          1,
+          DISK_KEY,
+          free,
+          bytes
+        );
+        return ok2 === 1;
+      } catch (e2) {
+        logger.error('Retry reserveDisk failed', { error: e2 });
+        return false;
+      }
+    }
+
+    return false;
+  }
 }
 
 /**
@@ -186,7 +244,9 @@ async function releaseDisk(bytes: number): Promise<void> {
   try {
     const val = await connection.decrby(DISK_KEY, bytes);
     if (val <= 0) await connection.del(DISK_KEY);
-  } catch { }
+  } catch (e) {
+    logger.error('releaseDisk failed', { error: e, key: DISK_KEY, bytes });
+  }
 }
 
 /**
@@ -309,11 +369,15 @@ function computeFileTTL(size: number): number {
 function computeVideoTTL(durationMs: number): number {
   const MULTIPLIER = 2.5; // encoding + overhead
   const BUFFER = 10 * 60 * 1000; // 10 min safety
+  const normalizedDurationMs =
+    Number.isFinite(durationMs) && durationMs > 0
+      ? durationMs
+      : 5 * 60 * 1000;
 
-  return Math.max(
-    durationMs * MULTIPLIER + BUFFER,
+  return Math.ceil(Math.max(
+    normalizedDurationMs * MULTIPLIER + BUFFER,
     30 * 60 * 1000 // minimum 30 min
-  );
+  ));
 }
 
 type PreviewRecord = {
@@ -331,12 +395,8 @@ async function materializeInputPath(
 ): Promise<{ inputPath: string; detectedExt: string | null; detectedMime: string | null }> {
   const detected = await fileTypeFromFile(rawInputPath).catch(() => undefined);
   const detectedExt = normalizeExtension(detected?.ext);
-  const inferredExt =
-    detectedExt ??
-    inferExtensionFromValue(job.inputUrl) ??
-    inferExtensionFromValue(job.outputKey);
 
-  if (!inferredExt) {
+  if (!detectedExt) {
     return {
       inputPath: rawInputPath,
       detectedExt,
@@ -344,7 +404,7 @@ async function materializeInputPath(
     };
   }
 
-  const resolvedPath = path.join(path.dirname(rawInputPath), `input${inferredExt}`);
+  const resolvedPath = path.join(path.dirname(rawInputPath), `input${detectedExt}`);
 
   if (resolvedPath !== rawInputPath) {
     await fs.promises.rm(resolvedPath, { force: true });
@@ -353,7 +413,7 @@ async function materializeInputPath(
 
   return {
     inputPath: resolvedPath,
-    detectedExt: detectedExt ?? inferredExt,
+    detectedExt,
     detectedMime: detected?.mime ?? null,
   };
 }
@@ -386,6 +446,10 @@ async function storePreviewRecord(jobId: string, preview: PreviewRecord): Promis
  * @param bullJob - Optional BullMQ job reference (for progress & retries)
  */
 export async function handleJob(job: FileJob, bullJob?: any) {
+  if (!SAFE_JOB_ID.test(job.fileId)) {
+    throw new Error('Invalid job id');
+  }
+
   /**
    * Use controlled temp directory instead of OS temp
    * Prevents hidden temp files and debugging issues
@@ -410,11 +474,12 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   );
 
   if (acquiredLock !== 'OK') {
-    console.log(`Skipping duplicate execution: ${job.fileId}`);
+    logger.info('Skipping duplicate execution', { jobId: job.fileId });
     return;
   }
+  logger.info('LOCK ACQUIRED', { jobId: job.fileId, worker: WORKER_ID });
 
-  console.log(`LOCK ACQUIRED: ${job.fileId} by ${WORKER_ID}`);
+  logger.info('Job started', { jobId: job.fileId, userId: job.userId, fileType: job.fileType });
   const userId = job.userId || 'local-user';
   const startTime = Date.now();
   let heartbeat: NodeJS.Timeout | null = null;
@@ -488,6 +553,23 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
     const materializedInput = await materializeInputPath(rawInputPath, job);
     safeInput = materializedInput.inputPath;
+    assertDetectedMediaMatchesDeclaration(
+      job.fileType,
+      job.inputUrl,
+      materializedInput.detectedMime,
+      materializedInput.detectedExt
+    );
+    await assertBasicFileHeader(
+      safeInput,
+      materializedInput.detectedMime,
+      materializedInput.detectedExt
+    );
+
+    const downloadedSize = (await fs.promises.stat(safeInput)).size;
+
+    if (downloadedSize > job.size || downloadedSize > config.security.maxUploadBytes) {
+      throw new Error('Downloaded file exceeds allowed size');
+    }
 
     /**
      * Probe the downloaded asset so we can fail early on obviously invalid inputs
@@ -501,10 +583,14 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       try {
         videoProbe = inspectVideoInput(safeInput);
       } catch (probeErr) {
-        console.warn('VIDEO PROBE FAILED, continuing with best effort:', job.fileId, probeErr);
+        logger.warn('VIDEO PROBE FAILED', { jobId: job.fileId, error: probeErr });
       }
 
-      if (videoProbe && !videoProbe.hasVideo) {
+      if (!videoProbe) {
+        throw new Error('Unable to inspect video metadata');
+      }
+
+      if (!videoProbe.hasVideo) {
         throw new Error('Input file does not contain a video stream');
       }
 
@@ -527,6 +613,8 @@ export async function handleJob(job: FileJob, bullJob?: any) {
               new Promise<void>((resolve, reject) => {
                 const ff = spawn(config.ffmpegPath, [
                   '-y',
+                  '-nostdin',
+                  ...LOCAL_PROTOCOL_ARGS,
                   '-fflags', '+genpts',
                   '-i', safeInput,
                   '-map', '0:v:0',
@@ -550,12 +638,22 @@ export async function handleJob(job: FileJob, bullJob?: any) {
           try {
             videoProbe = inspectVideoInput(safeInput);
           } catch (probeErr) {
-            console.warn('REMUX PROBE FAILED, keeping remuxed input:', job.fileId, probeErr);
+            logger.warn('REMUX PROBE FAILED, keeping remuxed input', { jobId: job.fileId, error: probeErr });
           }
         } catch (remuxErr) {
-          console.warn('MKV REMUX SKIPPED, falling back to direct decode:', job.fileId, remuxErr);
+          logger.warn('MKV REMUX SKIPPED, falling back to direct decode', { jobId: job.fileId, error: remuxErr });
         }
       }
+
+      if (!videoProbe) {
+        throw new Error('Unable to inspect video metadata');
+      }
+
+      assertAllowedMediaInput(job.fileType, materializedInput.detectedMime, job.inputUrl);
+      if (!videoProbe.hasVideo) {
+        throw new Error('Input file does not contain a video stream');
+      }
+      assertAllowedVideoProbe(videoProbe);
     }
 
     /**
@@ -596,7 +694,11 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       ttl = computeVideoTTL(videoDurationMs);
     }
 
-    await connection.pexpire(lockKey, Math.max(ttl, LOCK_TTL));
+    const lockTtlMs = Number.isFinite(ttl)
+      ? Math.max(Math.ceil(ttl), LOCK_TTL)
+      : LOCK_TTL;
+
+    await connection.pexpire(lockKey, lockTtlMs);
 
     // HEARTBEAT
     heartbeat = setInterval(async () => {
@@ -606,12 +708,12 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         if (owner === WORKER_ID) {
           await connection.pexpire(lockKey, LOCK_TTL);
         } else if (heartbeat) {
-          console.warn(`Lost lock ownership for ${job.fileId}`);
+          logger.warn('Lost lock ownership', { jobId: job.fileId });
           clearInterval(heartbeat);
           heartbeat = null;
         }
       } catch (err) {
-        console.error('Heartbeat error:', err);
+        logger.error('Heartbeat error', { jobId: job.fileId, error: err });
       }
     }, 60_000);
 
@@ -620,6 +722,15 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
     if (job.fileType === FILE_TYPE.IMAGE) {
       const result = await withCpuSlot(() => processImage(safeInput, outputBase));
+      outputPath = result.outputPath;
+
+      job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
+      await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING, {
+        progress: 100,
+        bullJob,
+      });
+    } else if (job.fileType === FILE_TYPE.PDF) {
+      const result = await withCpuSlot(() => processPdf(safeInput, outputBase));
       outputPath = result.outputPath;
 
       job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
@@ -649,7 +760,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         });
         previewReady = true;
       } catch (previewErr: any) {
-        console.warn('PREVIEW FAILED:', job.fileId, previewErr);
+        logger.warn('PREVIEW FAILED', { jobId: job.fileId, error: previewErr });
         await connection.hset(jobKey, {
           previewStatus: 'failed',
           previewError: previewErr?.message || 'Preview generation failed',
@@ -667,7 +778,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         processVideo(
           safeInput,
           finalOutput,
-          videoDurationMs ? { totalDuration: videoDurationMs } : undefined,
+          videoDurationMs ? { totalDuration: videoDurationMs, jobId: job.fileId } : { jobId: job.fileId },
           (progress) => {
             const normalized = Math.max(0, Math.min(Math.round(progress), 100));
             const now = Date.now();
@@ -689,7 +800,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
                 bullJob,
               }
             ).catch((progressErr) => {
-              console.error('Progress update failed:', progressErr);
+              logger.error('Progress update failed', { jobId: job.fileId, error: progressErr });
             });
           }
         )
@@ -734,7 +845,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     });
 
   } catch (err: any) {
-    console.error('JOB FAILED:', job.fileId, err);
+    logger.error('JOB FAILED', { jobId: job.fileId, error: err, attempts: bullJob?.attemptsMade });
     // Determine if the job can still be retried
     const isRetrying = bullJob && bullJob.attemptsMade < (bullJob.opts.attempts || 1);
     jobStatus = isRetrying ? JOB_STATUS.RETRYING : JOB_STATUS.FAILED;
@@ -742,7 +853,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
     /** Update failed state in Redis */
     await updateJobStage(job.fileId, jobStatus, JOB_STAGE.FAILED, {
-      error: err.message,
+      error: toPublicErrorMessage(err?.message),
       failedAt: Date.now(),
       attemptsMade: bullJob?.attemptsMade || 0,
       maxAttempts: bullJob?.opts.attempts || 1,
@@ -770,7 +881,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
        * If same error repeats, stop retrying early
        */
       if (isSameError && totalRetries >= 2) {
-        console.log(`Poison job detected: ${job.fileId}`);
+        logger.warn('Poison job detected', { jobId: job.fileId });
 
         await connection.rpush(
           REDIS_KEYS.DLQ,
@@ -786,14 +897,14 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       await connection.hset(REDIS_KEYS.JOB(job.fileId), 'lastError', lastError);
 
       if (shouldRequeue && totalRetries < MAX_TOTAL_RETRIES) {
-        console.log(`Requeueing job ${job.fileId} (attempt ${totalRetries + 1})`);
+        logger.info('Requeueing job', { jobId: job.fileId, attempt: totalRetries + 1 });
 
         await enqueueFile({
           ...job,
           retryCount: totalRetries + 1,
         });
       } else {
-        console.log(`Moving job ${job.fileId} to DLQ`);
+        logger.info('Moving job to DLQ', { jobId: job.fileId });
         await connection.rpush(REDIS_KEYS.DLQ, JSON.stringify(job));
       }
     }
@@ -841,8 +952,10 @@ export async function handleJob(job: FileJob, bullJob?: any) {
        */
       setTimeout(async () => {
         try {
-          await fs.promises.rm(tempDir, { recursive: true, force: true });
-        } catch { }
+            await fs.promises.rm(tempDir, { recursive: true, force: true });
+          } catch (cleanupErr) { 
+            logger.error('Cleanup deletion failed', { jobId: job.fileId, error: cleanupErr });
+          }
       }, 1000 * 60 * 30); // 30 minutes retention
     }
 
@@ -853,7 +966,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         await connection.del(lockKey);
       }
     } catch (err) {
-      console.error('Lock release error:', err);
+      logger.error('Lock release error', { jobId: job.fileId, error: err });
     }
     if (heartbeat) {
       clearInterval(heartbeat);

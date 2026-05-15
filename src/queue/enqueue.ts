@@ -1,8 +1,13 @@
 import { smallQueue, mediumQueue, largeQueue, imageQueue } from './queues';
 import { ATTEMPTS, FileJob } from '../types';
 import { connection } from './connection';
+import { logger } from '../utils/logger';
 import { FILE_TYPE, JOB_STAGE, JOB_STATUS, MB, QUEUE_NAME, REDIS_KEYS } from '../constants';
 import { classify, getPriority } from './priority';
+import { config } from '../config';
+import { assertAllowedMediaInput } from '../utils/media';
+
+const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
  * Enqueues a file processing job:
@@ -15,6 +20,17 @@ import { classify, getPriority } from './priority';
  * @returns Promise resolving to the BullMQ Job object
  */
 export async function enqueueFile(job: FileJob) {
+  if (!SAFE_JOB_ID.test(job.fileId)) {
+    throw new Error('Invalid job id');
+  }
+
+  if (!Number.isFinite(job.size) || job.size <= 0 || job.size > config.security.maxUploadBytes) {
+    throw new Error('Invalid upload size');
+  }
+
+  assertAllowedMediaInput(job.fileType, null, job.inputUrl);
+  assertAllowedMediaInput(job.fileType, null, job.outputKey);
+
   const sizeType = classify(job.size);
   /**
    * Assign a sessionId to isolate runs.
@@ -58,7 +74,7 @@ export async function enqueueFile(job: FileJob) {
             : QUEUE_NAME.LARGE,
     });
   } catch (e) {
-    console.error('REDIS WRITE FAILED', e);
+    logger.error('REDIS WRITE FAILED', { error: e });
   }
 
   /**
@@ -73,7 +89,7 @@ export async function enqueueFile(job: FileJob) {
   /**
    * Select correct queue based on file size
    */
-  if (job.fileType === FILE_TYPE.IMAGE) {
+  if (job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF) {
     queue = imageQueue;
   } else {
     if (sizeType === 'small') queue = smallQueue;

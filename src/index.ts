@@ -5,6 +5,7 @@ import { startAdminServer } from './server/http';
 import { startWS } from './server/ws';
 import { getFreeDiskSpace } from './utils/disk';
 import { cleanupTempDir } from './utils/cleanup';
+import { logger } from './utils/logger';
 
 // Import workers to initialize queues
 import './worker/fastWorker';
@@ -29,14 +30,14 @@ if (config.mode === 'local') {
   throw new Error(`Invalid MODE: ${config.mode}`);
 }
 
-console.log(`Running in ${config.mode} mode`);
+logger.info(`Running in ${config.mode} mode`, { mode: config.mode });
 
 startAdminServer();
 startWS();
 startPriorityScheduler();
 
 setInterval(() => {
-  recoverStuckJobs().catch(console.error);
+  recoverStuckJobs().catch((err) => logger.error('recoverStuckJobs failed', { error: err }));
 }, 60000); // every 1 min
 
 /**
@@ -50,7 +51,19 @@ setInterval(async () => {
       console.log('Running disk cleanup...');
       await cleanupTempDir();
     }
-  } catch (err) {
-    console.error('Cleanup error:', err);
+    } catch (err) {
+    logger.error('Cleanup error', { error: err });
   }
 }, 60_000); // every 1 min
+
+process.on('uncaughtException', (err) => {
+  try {
+    logger.fatal('uncaughtException', { error: err, sessionId: process.env.SESSION_ID });
+  } catch {}
+});
+
+process.on('unhandledRejection', (reason) => {
+  try {
+    logger.fatal('unhandledRejection', { reason, sessionId: process.env.SESSION_ID });
+  } catch {}
+});

@@ -9,35 +9,41 @@ import path from 'path';
 import { FILE_TYPE, JOB_STATUS, REDIS_KEYS } from '../constants';
 import { imageQueue, largeQueue, mediumQueue, smallQueue } from '../queue/queues';
 import { config } from '../config';
+import { isAdminRequestAuthorized } from '../security/auth';
+import { toPublicErrorMessage } from '../security/errors';
 
 const STATIC_ROOT = path.resolve(process.cwd(), 'outputs');
+const STATIC_CONTENT_TYPES: Record<string, string> = {
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.pdf': 'application/pdf',
+  'video/x-matroska': 'video/x-matroska',
+  'video/matroska': 'video/matroska',
+};
 const STATIC_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
-  'Access-Control-Allow-Headers': 'Range',
+  'Access-Control-Allow-Headers': 'Range, Authorization',
   'Cache-Control': 'no-cache',
   'Accept-Ranges': 'bytes',
+  'X-Content-Type-Options': 'nosniff',
 };
 
-function getContentType(filePath: string): string {
+function getContentType(filePath: string): string | null {
   const ext = path.extname(filePath).toLowerCase();
+  return STATIC_CONTENT_TYPES[ext] ?? null;
+}
 
-  if (ext === '.m3u8') return 'application/vnd.apple.mpegurl';
-  if (ext === '.ts') return 'video/mp2t';
-  if (ext === '.mp4') return 'video/mp4';
-  if (ext === '.mov') return 'video/quicktime';
-  if (ext === '.webm') return 'video/webm';
-  if (ext === '.png') return 'image/png';
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
-  if (ext === '.webp') return 'image/webp';
-  if (ext === '.gif') return 'image/gif';
-  if (ext === '.avif') return 'image/avif';
-  if (ext === '.heic') return 'image/heic';
-  if (ext === '.heif') return 'image/heif';
-  if (ext === '.tif' || ext === '.tiff') return 'image/tiff';
-  if (ext === '.svg') return 'image/svg+xml';
-
-  return 'application/octet-stream';
+function hasHiddenPathSegment(relativePath: string): boolean {
+  return relativePath
+    .replace(/\\/g, '/')
+    .split('/')
+    .some((segment) => segment.startsWith('.'));
 }
 
 function normalizeStoredAssetKey(key: string): string {
@@ -187,9 +193,15 @@ export function startAdminServer() {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Range',
+        'Access-Control-Allow-Headers': 'Range, Authorization',
       });
       return res.end();
+    }
+
+    if (req.url?.startsWith('/admin') && !isAdminRequestAuthorized(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
     }
 
     /**
@@ -200,7 +212,22 @@ export function startAdminServer() {
      */
     if (req.url?.startsWith('/static/')) {
       const requestPath = req.url.split('?')[0] || '';
-      const relativePath = decodeURIComponent(requestPath.replace('/static/', ''));
+      let relativePath = '';
+
+      try {
+        relativePath = decodeURIComponent(requestPath.replace('/static/', ''));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json', ...STATIC_HEADERS });
+        res.end(JSON.stringify({ error: 'Invalid path' }));
+        return;
+      }
+
+      if (hasHiddenPathSegment(relativePath)) {
+        res.writeHead(403, { 'Content-Type': 'application/json', ...STATIC_HEADERS });
+        res.end(JSON.stringify({ error: 'Forbidden' }));
+        return;
+      }
+
       const filePath = path.resolve(STATIC_ROOT, relativePath);
 
       if (!filePath.startsWith(`${STATIC_ROOT}${path.sep}`) && filePath !== STATIC_ROOT) {
@@ -226,6 +253,13 @@ export function startAdminServer() {
       }
 
       const contentType = getContentType(filePath);
+
+      if (!contentType) {
+        res.writeHead(403, { 'Content-Type': 'application/json', ...STATIC_HEADERS });
+        res.end(JSON.stringify({ error: 'Forbidden' }));
+        return;
+      }
+
       const range = req.headers.range;
 
       if (range) {
@@ -370,6 +404,7 @@ export function startAdminServer() {
        */
       const fileType =
         meta.fileType === FILE_TYPE.VIDEO ||
+          meta.fileType === FILE_TYPE.IMAGE ||
           meta.fileType === FILE_TYPE.PDF ||
           meta.fileType === FILE_TYPE.ZIP ||
           meta.fileType === FILE_TYPE.OTHER
@@ -449,7 +484,7 @@ export function startAdminServer() {
         createdAt: meta.createdAt,
         startedAt: meta.startedAt,
         completedAt: meta.completedAt,
-        error: meta.error || null
+        error: meta.error ? toPublicErrorMessage(meta.error) : null
       }));
 
       return;

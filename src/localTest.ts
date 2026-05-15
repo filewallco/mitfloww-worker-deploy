@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import { FileJob } from './types';
 import { FILE_TYPE } from './constants';
 import { fileTypeFromFile } from 'file-type';
-import { classifyFileType, inferExtensionFromValue } from './utils/media';
+import { classifyFileType } from './utils/media';
 
 const TEST_DIR = path.join(__dirname, '../test-files');
 
@@ -57,18 +57,17 @@ async function enqueueSafe(file: string) {
 
   const stats = fs.statSync(fullPath); // Get file size
   const detected = await fileTypeFromFile(fullPath).catch(() => undefined);
-  const fileType = classifyFileType(
-    detected?.mime,
-    detected?.ext ? `sample.${detected.ext}` : inferExtensionFromValue(file)
-  );
+  const fileType = detected
+    ? classifyFileType(detected.mime, `sample.${detected.ext}`)
+    : FILE_TYPE.OTHER;
 
-  if (fileType !== FILE_TYPE.IMAGE && fileType !== FILE_TYPE.VIDEO) {
+  if (fileType !== FILE_TYPE.IMAGE && fileType !== FILE_TYPE.VIDEO && fileType !== FILE_TYPE.PDF) {
     console.log(`Skipping unsupported file: ${file}`);
     return;
   }
 
   const outputKey =
-    fileType === FILE_TYPE.IMAGE
+    fileType === FILE_TYPE.IMAGE || fileType === FILE_TYPE.PDF
       ? `local/${path.parse(file).name}${path.extname(file)}`
       : `local/${file}`;
   const job: FileJob = {
