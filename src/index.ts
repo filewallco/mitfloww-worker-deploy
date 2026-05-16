@@ -18,16 +18,21 @@ process.env.SESSION_ID = Date.now().toString();
 
 /**
  * Entry point for MitFloww.
- * - Server mode: starts HTTP server.
- * - Local mode: runs test runner for enqueuing jobs.
+ *
+ * Server mode:
+ * - Starts workers
+ * - Starts HTTP API
+ * - Waits for Next.js to enqueue jobs through POST /jobs
+ *
+ * Local test mode:
+ * - Only runs localTest when explicitly enabled
  */
-if (config.mode === 'local') {
-  require('./localTest');
-} else if (config.mode === 'server') {
-  const { startServer } = require('./server');
-  startServer();
-} else {
+if (config.mode !== "local" && config.mode !== "server") {
   throw new Error(`Invalid MODE: ${config.mode}`);
+}
+
+if (config.mode === "local" && process.env.ENABLE_LOCAL_TEST === "true") {
+  require("./localTest");
 }
 
 logger.info(`Running in ${config.mode} mode`, { mode: config.mode });

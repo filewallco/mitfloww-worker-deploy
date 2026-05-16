@@ -2,8 +2,7 @@ import { smallQueue, mediumQueue, largeQueue } from '../queue/queues';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
 import { imageQueue } from '../queue/queues';
-import { JOB_STAGE, JOB_STATUS, QUEUE_NAME } from '../constants';
-
+import { FILE_TYPE, JOB_STAGE, JOB_STATUS, QUEUE_NAME } from '../constants';
 /**
  * Returns structured system snapshot.
  * Separates LIVE jobs and HISTORY jobs.
@@ -268,6 +267,7 @@ export async function recoverStuckJobs() {
         });
 
         const existing =
+          await imageQueue.getJob(jobId) ||
           await smallQueue.getJob(jobId) ||
           await mediumQueue.getJob(jobId) ||
           await largeQueue.getJob(jobId);
@@ -276,15 +276,69 @@ export async function recoverStuckJobs() {
           await existing.remove();
         }
 
+        const fileType =
+          meta.fileType === FILE_TYPE.VIDEO ||
+          meta.fileType === FILE_TYPE.IMAGE ||
+          meta.fileType === FILE_TYPE.PDF ||
+          meta.fileType === FILE_TYPE.ZIP ||
+          meta.fileType === FILE_TYPE.OTHER
+            ? meta.fileType
+            : FILE_TYPE.OTHER;
+
+        const userTier =
+          meta.userTier === "free" ||
+          meta.userTier === "premium" ||
+          meta.userTier === "vip"
+            ? meta.userTier
+            : "free";
+
+        const size = Number(meta.size);
+
+        if (!Number.isFinite(size) || size <= 0) {
+          console.warn(`Skipping stuck job recovery with invalid size: ${jobId}`);
+          continue;
+        }
+
+        if (!meta.outputKey) {
+          console.warn(`Skipping stuck job recovery without outputKey: ${jobId}`);
+          continue;
+        }
+
+        const hasR2Source = Boolean(meta.sourceBucket && meta.sourceKey);
+        const hasAllowedRemoteUrl =
+          Boolean(meta.inputUrl) &&
+          !meta.inputUrl.startsWith("file://") &&
+          process.env.ALLOW_REMOTE_INPUT_URLS === "true";
+
+        if (!hasR2Source && !hasAllowedRemoteUrl) {
+          console.warn(`Skipping stuck job recovery without R2 source: ${jobId}`);
+          continue;
+        }
+
         await enqueueFile({
           fileId: jobId,
-          inputUrl: meta.inputUrl,
+
+          inputUrl: hasAllowedRemoteUrl ? meta.inputUrl : undefined,
+          sourceBucket: meta.sourceBucket || undefined,
+          sourceKey: meta.sourceKey || undefined,
+          outputBucket: meta.outputBucket || undefined,
           outputKey: meta.outputKey,
-          fileType: meta.fileType as any,
-          size: Number(meta.size),
-          userTier: meta.userTier as any,
-          userId: meta.userId || 'retry-user',
+          logKey: meta.logKey || undefined,
+
+          fileVersionId: meta.fileVersionId || undefined,
+          fileName: meta.fileName || undefined,
+          originalName: meta.originalName || undefined,
+          mimeType: meta.mimeType || undefined,
+          extension: meta.extension || undefined,
+
+          fileType,
+          size,
+          userTier,
+          userId: meta.userId || "retry-user",
           batchId: meta.batchId || undefined,
+
+          callbackUrl: meta.callbackUrl || undefined,
+          callbackToken: process.env.PROCESSING_CALLBACK_TOKEN || meta.callbackToken || "",
         });
       }
     }

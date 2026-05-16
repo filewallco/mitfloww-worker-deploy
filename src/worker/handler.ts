@@ -1,5 +1,5 @@
 import { FileJob, JobStatus } from '../types';
-import { download, upload } from '../utils/r2';
+import { downloadFromR2, uploadJsonToR2, uploadToR2, upload, download } from "../utils/r2";
 // import { acquire, release } from './admission';
 import path from 'path';
 import fs from 'fs';
@@ -438,6 +438,52 @@ async function storePreviewRecord(jobId: string, preview: PreviewRecord): Promis
 }
 
 /**
+ * notifyCallback sends a POST request to the job's callback URL with the provided payload. It includes the job ID, file ID, and any additional information in the payload. The function also handles errors gracefully, logging any issues that occur during the callback attempt. This allows external services to be notified of job completion, progress updates, or failures in a standardized way.
+ * @param job - The FileJob object containing metadata and callback information
+ * @param payload - An object containing additional data to include in the callback request
+ * The payload will be merged with the job's fileId and fileVersionId to provide context to the callback receiver.
+ * If the job does not have a callback URL defined, the function will simply return without attempting to send a request.
+ * Errors during the fetch operation are caught and logged, but do not throw exceptions to ensure that the main job processing flow is not disrupted by callback issues.
+ * This function is essential for integrating the file processing system with external workflows, allowing for real-time notifications and updates based on job status changes.
+ * Example usage:
+ * notifyCallback(job, { status: 'completed', outputUrl: 'https://example.com/output.mp4' });
+ * This would send a POST request to the job's callback URL with a JSON body containing the job ID, file ID, file version ID, status, and output URL.
+ * The callback receiver can then use this information to take appropriate actions, such as updating a user interface, triggering additional processing, or sending notifications to users.
+ * Overall, this function provides a flexible and robust mechanism for communicating job outcomes to external systems in a decoupled manner.
+ * Note: Ensure that the callback URL is secure and that the callback token is used to authenticate requests to prevent unauthorized access.
+ * The callback payload can be extended to include any relevant information about the job or its output, making it a powerful tool for integrating with various services and workflows.
+ * The function is designed to be resilient, ensuring that even if the callback fails, it does not impact the main processing of the job, while still providing valuable logging for troubleshooting callback issues.
+ * In summary, notifyCallback is a critical component for enabling communication between the file processing system and external services, allowing for dynamic and responsive workflows based on job events.
+ * @param job - The FileJob object containing metadata and callback information
+ * @param payload - An object containing additional data to include in the callback request
+ * The payload will be merged with the job's fileId and fileVersionId to provide context to the callback receiver.
+ * If the job does not have a callback URL defined, the function will simply return without attempting to send a request.
+ * Errors during the fetch operation are caught and logged, but do not throw exceptions to ensure that the main job processing flow is not disrupted by callback issues.
+ */
+async function notifyCallback(job: FileJob, payload: Record<string, any>) {
+  if (!job.callbackUrl) return;
+
+  await fetch(job.callbackUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.PROCESSING_CALLBACK_TOKEN || job.callbackToken || ""}`,
+    },
+    body: JSON.stringify({
+      jobId: job.fileId,
+      fileId: payload.fileId ?? job.fileId,
+      fileVersionId: job.fileVersionId,
+      ...payload,
+    }),
+  }).catch((error) => {
+    logger.error("Processing callback failed", {
+      jobId: job.fileId,
+      error,
+    });
+  });
+}
+
+/**
  * Main job handler.
  * Handles the lifecycle of a file job: downloading, processing, uploading,
  * retrying on failure, and optionally moving to DLQ.
@@ -547,17 +593,33 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     });
 
     /**
-     * STEP 4: Download AFTER admission
+     * STEP 4: Download input to local temp path
      */
-    await download(job.inputUrl, rawInputPath);
+    if (job.sourceBucket && job.sourceKey) {
+      await downloadFromR2({
+        bucket: job.sourceBucket,
+        key: job.sourceKey,
+        dest: rawInputPath,
+      });
+    } else if (job.inputUrl) {
+      await download(job.inputUrl, rawInputPath);
+    } else {
+      throw new Error("Missing source object.");
+    }
 
     const materializedInput = await materializeInputPath(rawInputPath, job);
     safeInput = materializedInput.inputPath;
+    const declaredInputValue =
+      job.sourceKey ??
+      job.inputUrl ??
+      job.originalName ??
+      job.outputKey;
+
     assertDetectedMediaMatchesDeclaration(
       job.fileType,
-      job.inputUrl,
+      declaredInputValue,
       materializedInput.detectedMime,
-      materializedInput.detectedExt
+      materializedInput.detectedExt,
     );
     await assertBasicFileHeader(
       safeInput,
@@ -649,7 +711,7 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         throw new Error('Unable to inspect video metadata');
       }
 
-      assertAllowedMediaInput(job.fileType, materializedInput.detectedMime, job.inputUrl);
+      assertAllowedMediaInput(job.fileType, materializedInput.detectedMime, declaredInputValue);
       if (!videoProbe.hasVideo) {
         throw new Error('Input file does not contain a video stream');
       }
@@ -748,7 +810,16 @@ export async function handleJob(job: FileJob, bullJob?: any) {
        */
       try {
         await withCpuSlot(() => generatePreviewClip(safeInput, previewPath, 8));
-        await upload(previewPath, previewKey);
+        if (job.outputBucket) {
+          await uploadToR2({
+            bucket: job.outputBucket,
+            key: previewKey,
+            filePath: previewPath,
+            contentType: "video/mp4",
+          });
+        } else {
+          await upload(previewPath, previewKey);
+        }
         await storePreviewRecord(job.fileId, {
           kind: 'progressive',
           key: previewKey,
@@ -817,9 +888,26 @@ export async function handleJob(job: FileJob, bullJob?: any) {
     /** Stage 3: Uploading the processed file */
     await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.UPLOADING);
     /**
-     * Upload final output for ALL file types (including video)
+     * Wait for file to be fully written before upload (important for videos)
      */
-    const result = await upload(outputPath, job.outputKey);
+    let result: {
+        bucket?: string;
+        key?: string;
+        sizeBytes?: number;
+        contentType?: string;
+      } | string;
+
+      if (job.outputBucket) {
+        const uploaded = await uploadToR2({
+          bucket: job.outputBucket,
+          key: job.outputKey,
+          filePath: outputPath,
+        });
+
+        result = uploaded;
+      } else {
+        result = await upload(outputPath, job.outputKey);
+      }
 
     if (job.fileType === FILE_TYPE.VIDEO && !previewReady) {
       await storePreviewRecord(job.fileId, {
@@ -844,6 +932,52 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       bullJob,
     });
 
+    const processedResult =
+      typeof result === "string"
+        ? {
+            bucket: job.outputBucket || process.env.R2_BUCKET_NAME || "",
+            key: job.outputKey,
+            mimeType: job.mimeType || "application/octet-stream",
+            extension: path.extname(job.outputKey),
+            sizeBytes: outputPath ? (await fs.promises.stat(outputPath)).size : 0,
+          }
+        : {
+            bucket: result.bucket || job.outputBucket || "",
+            key: result.key || job.outputKey,
+            mimeType: result.contentType || job.mimeType || "application/octet-stream",
+            extension: path.extname(result.key || job.outputKey),
+            sizeBytes: result.sizeBytes || 0,
+          };
+
+    let logObject: { bucket: string; key: string } | null = null;
+
+    if (job.outputBucket && job.logKey) {
+      const logsRaw = await connection.lrange(REDIS_KEYS.JOB_LOGS(job.fileId), 0, -1);
+      const logs = logsRaw.map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return { raw: line };
+        }
+      });
+
+      logObject = await uploadJsonToR2({
+        bucket: job.outputBucket,
+        key: job.logKey,
+        payload: {
+          jobId: job.fileId,
+          fileVersionId: job.fileVersionId,
+          logs,
+        },
+      });
+    }
+
+    await notifyCallback(job, {
+      status: "completed",
+      processed: processedResult,
+      log: logObject,
+    });
+
   } catch (err: any) {
     logger.error('JOB FAILED', { jobId: job.fileId, error: err, attempts: bullJob?.attemptsMade });
     // Determine if the job can still be retried
@@ -860,6 +994,17 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       success: false,
       bullJob,
     });
+
+    if (!isRetrying) {
+      await notifyCallback(job, {
+        status:
+          toPublicErrorMessage(err?.message) === "Invalid or unsupported media file"
+            ? "corrupt"
+            : "failed",
+        errorCode: "processing_failed",
+        errorMessage: toPublicErrorMessage(err?.message),
+      });
+    }
 
     /** Requeue logic or Dead Letter Queue (DLQ) */
     if (!isRetrying) {

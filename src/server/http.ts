@@ -34,6 +34,46 @@ const STATIC_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
 };
 
+function readJson(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+
+    req.on("data", (chunk) => {
+      raw += chunk;
+      if (raw.length > 1024 * 1024) {
+        reject(new Error("Request body too large"));
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        reject(new Error("Invalid JSON"));
+      }
+    });
+
+    req.on("error", reject);
+  });
+}
+
+function isWorkerRequestAuthorized(req: http.IncomingMessage) {
+  const expected = process.env.WORKER_API_TOKEN || config.adminToken;
+  if (config.mode === "local" && !expected) return true;
+
+  const actual = req.headers.authorization?.replace(/^Bearer\s+/i, "").trim();
+  return Boolean(expected && actual === expected);
+}
+
+function classifyFileTypeFromMime(mimeType: string, extension: string) {
+  if (mimeType.startsWith("image/")) return FILE_TYPE.IMAGE;
+  if (mimeType.startsWith("video/")) return FILE_TYPE.VIDEO;
+  if (mimeType === "application/pdf" || extension === ".pdf") return FILE_TYPE.PDF;
+  if (extension === ".zip") return FILE_TYPE.ZIP;
+  return FILE_TYPE.OTHER;
+}
+
 function getContentType(filePath: string): string | null {
   const ext = path.extname(filePath).toLowerCase();
   return STATIC_CONTENT_TYPES[ext] ?? null;
@@ -55,10 +95,15 @@ function normalizeStoredAssetKey(key: string): string {
 
 function buildPublicAssetUrl(key: string): string {
   const normalizedKey = normalizeStoredAssetKey(key);
+  const publicBaseUrl = process.env.R2_PUBLIC_BASE_URL?.replace(/\/+$/, "");
 
-  return config.mode === 'local'
+  if (config.mode !== "local" && !publicBaseUrl) {
+    throw new Error("R2_PUBLIC_BASE_URL is required in server mode.");
+  }
+
+  return config.mode === "local"
     ? `http://localhost:4000/static/${encodeURI(normalizedKey)}`
-    : `https://your-r2-domain/${encodeURI(normalizedKey)}`;
+    : `${publicBaseUrl}/${encodeURI(normalizedKey)}`;
 }
 
 function normalizePreviewKeys(keys: string[]) {
@@ -196,6 +241,78 @@ export function startAdminServer() {
         'Access-Control-Allow-Headers': 'Range, Authorization',
       });
       return res.end();
+    }
+
+    if (req.url === "/jobs" && req.method === "POST") {
+      if (!isWorkerRequestAuthorized(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      try {
+        const body = await readJson(req);
+
+        const required = [
+          "jobId",
+          "fileId",
+          "fileVersionId",
+          "sourceBucket",
+          "sourceKey",
+          "outputBucket",
+          "outputKey",
+          "sizeBytes",
+          "mimeType",
+          "extension",
+          "callbackUrl",
+        ];
+
+        for (const key of required) {
+          if (body[key] == null || body[key] === "") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `${key} is required` }));
+            return;
+          }
+        }
+
+        const fileType = classifyFileTypeFromMime(body.mimeType, body.extension);
+
+        const job = await enqueueFile({
+          fileId: body.jobId,
+          fileVersionId: body.fileVersionId,
+          sourceBucket: body.sourceBucket,
+          sourceKey: body.sourceKey,
+          outputBucket: body.outputBucket,
+          outputKey: body.outputKey,
+          logKey: body.logKey,
+          fileName: body.fileName,
+          originalName: body.originalName,
+          mimeType: body.mimeType,
+          extension: body.extension,
+          size: Number(body.sizeBytes),
+          fileType,
+          userTier: body.user?.tier || "free",
+          userId: body.user?.id || body.user?.email || "anonymous",
+          userEmail: body.user?.email || null,
+          userName: body.user?.name || null,
+          callbackUrl: body.callbackUrl,
+          callbackToken: process.env.PROCESSING_CALLBACK_TOKEN || body.callbackToken || "",
+        });
+
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          jobId: body.jobId,
+          status: "queued",
+          queueName: job.queueName,
+        }));
+        return;
+      } catch (error) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: error instanceof Error ? error.message : "Invalid request",
+        }));
+        return;
+      }
     }
 
     if (req.url?.startsWith('/admin') && !isAdminRequestAuthorized(req)) {
@@ -418,7 +535,7 @@ export function startAdminServer() {
           ? meta.userTier
           : 'free';
 
-      if (!meta.inputUrl || !meta.outputKey) {
+      if ((!meta.inputUrl && (!meta.sourceBucket || !meta.sourceKey)) || !meta.outputKey) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: 'Invalid job metadata for retry' }));
         return;
@@ -441,13 +558,27 @@ export function startAdminServer() {
        */
       await enqueueFile({
         fileId: id!,
-        inputUrl: meta.inputUrl,
+        inputUrl: meta.inputUrl || undefined,
+        sourceBucket: meta.sourceBucket || undefined,
+        sourceKey: meta.sourceKey || undefined,
+        outputBucket: meta.outputBucket || undefined,
         outputKey: meta.outputKey,
+        logKey: meta.logKey || undefined,
+
+        fileVersionId: meta.fileVersionId || undefined,
+        fileName: meta.fileName || undefined,
+        originalName: meta.originalName || undefined,
+        mimeType: meta.mimeType || undefined,
+        extension: meta.extension || undefined,
+
         fileType,
-        size: size,
+        size,
         userTier,
-        userId: meta.userId || 'recovered-user',
+        userId: meta.userId || "recovered-user",
         batchId: meta.batchId || undefined,
+
+        callbackUrl: meta.callbackUrl || undefined,
+        callbackToken: process.env.PROCESSING_CALLBACK_TOKEN || meta.callbackToken || "",
       });
 
       res.writeHead(200);

@@ -2,10 +2,10 @@ import { smallQueue, mediumQueue, largeQueue, imageQueue } from './queues';
 import { ATTEMPTS, FileJob } from '../types';
 import { connection } from './connection';
 import { logger } from '../utils/logger';
-import { FILE_TYPE, JOB_STAGE, JOB_STATUS, MB, QUEUE_NAME, REDIS_KEYS } from '../constants';
-import { classify, getPriority } from './priority';
 import { config } from '../config';
 import { assertAllowedMediaInput } from '../utils/media';
+import { FILE_TYPE, JOB_STAGE, JOB_STATUS, QUEUE_NAME, REDIS_KEYS } from "../constants";
+import { classify, getPriority } from "./priority";
 
 const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -28,7 +28,13 @@ export async function enqueueFile(job: FileJob) {
     throw new Error('Invalid upload size');
   }
 
-  assertAllowedMediaInput(job.fileType, null, job.inputUrl);
+  const declaredInputValue =
+    job.sourceKey ??
+    job.inputUrl ??
+    job.originalName ??
+    job.outputKey;
+
+  assertAllowedMediaInput(job.fileType, job.mimeType ?? null, declaredInputValue);
   assertAllowedMediaInput(job.fileType, null, job.outputKey);
 
   const sizeType = classify(job.size);
@@ -46,6 +52,21 @@ export async function enqueueFile(job: FileJob) {
     ? Number(existing.retryCount) + 1
     : 0;
 
+  const inputRef =
+    job.inputUrl ??
+    (job.sourceBucket && job.sourceKey
+      ? `r2://${job.sourceBucket}/${job.sourceKey}`
+      : declaredInputValue);
+
+  const queueName =
+    job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF
+      ? QUEUE_NAME.IMAGE
+      : sizeType === "small"
+        ? QUEUE_NAME.SMALL
+        : sizeType === "medium"
+          ? QUEUE_NAME.MEDIUM
+          : QUEUE_NAME.LARGE;
+
   /**
    * Store initial metadata in Redis.
    * Redis becomes the single source of truth for UI.
@@ -57,24 +78,30 @@ export async function enqueueFile(job: FileJob) {
       stage: JOB_STAGE.WAITING,
       createdAt: existing.createdAt ? Number(existing.createdAt) : Date.now(),
       queuedAt: Date.now(),
-      inputUrl: job.inputUrl,
+      inputUrl: inputRef,
+      sourceBucket: job.sourceBucket ?? "",
+      sourceKey: job.sourceKey ?? "",
+      outputBucket: job.outputBucket ?? "",
       outputKey: job.outputKey,
+      logKey: job.logKey ?? "",
+      fileVersionId: job.fileVersionId ?? "",
+      fileName: job.fileName ?? "",
+      originalName: job.originalName ?? "",
+      mimeType: job.mimeType ?? "",
+      extension: job.extension ?? "",
       fileType: job.fileType,
       size: job.size,
       userTier: job.userTier,
       progress: 0,
       retryCount,
       userId: job.userId,
-      batchId: job.batchId || null,
-      queueName:
-        sizeType === 'small'
-          ? QUEUE_NAME.SMALL
-          : sizeType === 'medium'
-            ? QUEUE_NAME.MEDIUM
-            : QUEUE_NAME.LARGE,
+      batchId: job.batchId || "",
+      callbackUrl: job.callbackUrl ?? "",
+      callbackToken: job.callbackToken ?? "",
+      queueName,
     });
   } catch (e) {
-    logger.error('REDIS WRITE FAILED', { error: e });
+    logger.error("REDIS WRITE FAILED", { error: e });
   }
 
   /**
@@ -84,18 +111,14 @@ export async function enqueueFile(job: FileJob) {
    */ 
   await connection.expire(REDIS_KEYS.JOB(job.fileId), 60 * 60 * 24);
   
-  let queue;
-  
-  /**
-   * Select correct queue based on file size
-   */
-  if (job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF) {
-    queue = imageQueue;
-  } else {
-    if (sizeType === 'small') queue = smallQueue;
-    else if (sizeType === 'medium') queue = mediumQueue;
-    else queue = largeQueue;
-  }
+  const queue =
+  queueName === QUEUE_NAME.IMAGE
+    ? imageQueue
+    : queueName === QUEUE_NAME.SMALL
+      ? smallQueue
+      : queueName === QUEUE_NAME.MEDIUM
+        ? mediumQueue
+        : largeQueue;
 
   /**
    * Add job to the appropriate queue
