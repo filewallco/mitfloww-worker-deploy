@@ -6,7 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
-import { assertAllowedVideoProbe, generatePreviewClip, inspectVideoInput, processVideo } from '../processors/video';
+import { assertAllowedVideoProbe, inspectVideoInput, processVideo } from '../processors/video';
 import { getFreeDiskSpace } from '../utils/disk';
 import { config } from '../config';
 import { processImage } from '../processors/image';
@@ -327,7 +327,7 @@ async function updateJobStage(
   const payload = {
     status,
     stage,
-    ...extra,
+    ...safeExtra,
     updatedAt: Date.now(),
   };
 
@@ -346,7 +346,7 @@ async function updateJobStage(
       time: Date.now(),
       stage,
       status,
-      ...extra,
+      ...safeExtra,
     })
   );
 
@@ -380,15 +380,6 @@ function computeVideoTTL(durationMs: number): number {
   ));
 }
 
-type PreviewRecord = {
-  kind: 'progressive' | 'hls';
-  key?: string;
-  manifestKey?: string;
-  keys?: string[];
-  fallback?: boolean;
-  source?: 'preview' | 'final';
-};
-
 async function materializeInputPath(
   rawInputPath: string,
   job: FileJob
@@ -416,25 +407,6 @@ async function materializeInputPath(
     detectedExt,
     detectedMime: detected?.mime ?? null,
   };
-}
-
-function buildPreviewKey(outputKey: string): string {
-  const normalized = outputKey.replace(/\\/g, '/');
-  const parsed = path.posix.parse(normalized);
-  const previewFile = `${parsed.name || 'preview'}.preview.mp4`;
-
-  return parsed.dir
-    ? path.posix.join(parsed.dir, previewFile)
-    : previewFile;
-}
-
-async function storePreviewRecord(jobId: string, preview: PreviewRecord): Promise<void> {
-  await connection.set(
-    REDIS_KEYS.PREVIEW(jobId),
-    JSON.stringify(preview),
-    'EX',
-    60 * 60 * 24
-  );
 }
 
 /**
@@ -536,7 +508,6 @@ export async function handleJob(job: FileJob, bullJob?: any) {
   let outputPath = '';
   let safeInput = rawInputPath;
   let videoDurationMs: number | null = null;
-  let previewReady = false;
   let jobStatus: JobStatus = JOB_STATUS.PROCESSING;
 
   const acquireLocalCpuSlot = async () => {
@@ -568,9 +539,6 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
     await acquireUserSlot(userId, limit);
     userSlotAcquired = true;
-
-    await connection.del(REDIS_KEYS.PREVIEW(job.fileId));
-    await connection.hdel(jobKey, 'previewStatus', 'previewError', 'previewKey');
 
     /**
      * STEP 3: Prepare temp dir BEFORE download
@@ -769,6 +737,12 @@ export async function handleJob(job: FileJob, bullJob?: any) {
 
         if (owner === WORKER_ID) {
           await connection.pexpire(lockKey, LOCK_TTL);
+
+          await connection.hset(jobKey, {
+            status: JOB_STATUS.PROCESSING,
+            updatedAt: Date.now(),
+            heartbeatAt: Date.now(),
+          });
         } else if (heartbeat) {
           logger.warn('Lost lock ownership', { jobId: job.fileId });
           clearInterval(heartbeat);
@@ -801,45 +775,14 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         bullJob,
       });
     } else if (job.fileType === FILE_TYPE.VIDEO) {
-      const previewPath = path.join(tempDir, 'preview.mp4');
-      const previewKey = buildPreviewKey(job.outputKey);
-
       /**
-       * Preview should never block the main video pipeline.
-       * If it fails, we still complete the final encode and expose that as fallback.
-       */
-      try {
-        await withCpuSlot(() => generatePreviewClip(safeInput, previewPath, 8));
-        if (job.outputBucket) {
-          await uploadToR2({
-            bucket: job.outputBucket,
-            key: previewKey,
-            filePath: previewPath,
-            contentType: "video/mp4",
-          });
-        } else {
-          await upload(previewPath, previewKey);
-        }
-        await storePreviewRecord(job.fileId, {
-          kind: 'progressive',
-          key: previewKey,
-          source: 'preview',
-        });
-        await connection.hset(jobKey, {
-          previewStatus: 'ready',
-          previewKey,
-        });
-        previewReady = true;
-      } catch (previewErr: any) {
-        logger.warn('PREVIEW FAILED', { jobId: job.fileId, error: previewErr });
-        await connection.hset(jobKey, {
-          previewStatus: 'failed',
-          previewError: previewErr?.message || 'Preview generation failed',
-        });
-      }
-
-      /**
-       * STEP 3: Full processing (heavy CPU)
+       * Full watermarked video processing.
+       *
+       * In Mitfloww, this is the customer preview:
+       * - full duration
+       * - watermarked
+       * - uploaded as processed file
+       * - shown to client for review/update requests
        */
       const finalOutput = `${outputBase}.mp4`;
       let lastProgress = -1;
@@ -849,7 +792,9 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         processVideo(
           safeInput,
           finalOutput,
-          videoDurationMs ? { totalDuration: videoDurationMs, jobId: job.fileId } : { jobId: job.fileId },
+          videoDurationMs
+            ? { totalDuration: videoDurationMs, jobId: job.fileId }
+            : { jobId: job.fileId },
           (progress) => {
             const normalized = Math.max(0, Math.min(Math.round(progress), 100));
             const now = Date.now();
@@ -869,11 +814,14 @@ export async function handleJob(job: FileJob, bullJob?: any) {
               {
                 progress: normalized,
                 bullJob,
-              }
+              },
             ).catch((progressErr) => {
-              logger.error('Progress update failed', { jobId: job.fileId, error: progressErr });
+              logger.error("Progress update failed", {
+                jobId: job.fileId,
+                error: progressErr,
+              });
             });
-          }
+          },
         )
       );
 
@@ -908,19 +856,6 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       } else {
         result = await upload(outputPath, job.outputKey);
       }
-
-    if (job.fileType === FILE_TYPE.VIDEO && !previewReady) {
-      await storePreviewRecord(job.fileId, {
-        kind: 'progressive',
-        key: job.outputKey,
-        source: 'final',
-        fallback: true,
-      });
-      await connection.hset(jobKey, {
-        previewStatus: 'fallback',
-        previewKey: job.outputKey,
-      });
-    }
 
     /** Job successfully completed */
     jobStatus = JOB_STATUS.COMPLETED;

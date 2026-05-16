@@ -199,7 +199,7 @@ export function processVideo(
       '-c:a', 'aac',
       '-movflags', '+faststart',
       '-progress', 'pipe:2',
-      '-threads',  String(getFfmpegThreads()),
+      '-threads', String(getFfmpegThreads()),
       output,
     ];
 
@@ -212,7 +212,7 @@ export function processVideo(
 
     function cleanup() {
       clearInterval(stallCheck);
-      clearTimeout(hardTimeout);
+      if (hardTimeout) clearTimeout(hardTimeout);
     }
 
     function safeReject(err: Error) {
@@ -269,9 +269,13 @@ export function processVideo(
 
     // STALL DETECTION
     const stallCheck = setInterval(() => {
-      const STALL_LIMIT = 5 * 60 * 1000;
+      /**
+       * Stall detection is based on lack of FFmpeg progress, not total duration.
+       * Set FFMPEG_STALL_LIMIT_MS=0 to disable.
+       */
+      const STALL_LIMIT = Number(process.env.FFMPEG_STALL_LIMIT_MS || 30 * 60 * 1000);
 
-      if (Date.now() - lastProgressTime > STALL_LIMIT) {
+      if (STALL_LIMIT > 0 && Date.now() - lastProgressTime > STALL_LIMIT) {
         const err = new Error('FFmpeg stalled');
         logger.error('FFmpeg stalled', { jobId: options?.jobId, input, output, lastStderr: stderrBuffer.getLines() });
         ffmpeg.kill('SIGKILL');
@@ -279,15 +283,29 @@ export function processVideo(
       }
     }, 60_000);
 
-    // HARD TIMEOUT
-    const MAX_RUNTIME = 6 * 60 * 60 * 1000;
+    /**
+     * Optional hard timeout.
+     *
+     * Default is disabled because valid 5GB+ videos can take many hours.
+     * Set FFMPEG_MAX_RUNTIME_MS only if you explicitly want a ceiling.
+     */
+    const maxRuntimeMs = Number(process.env.FFMPEG_MAX_RUNTIME_MS || 0);
 
-    const hardTimeout = setTimeout(() => {
-      const err = new Error('FFmpeg max runtime exceeded');
-      logger.error('FFmpeg max runtime exceeded', { jobId: options?.jobId, input, output, lastStderr: stderrBuffer.getLines() });
-      ffmpeg.kill('SIGKILL');
-      safeReject(err);
-    }, MAX_RUNTIME);
+    const hardTimeout =
+      maxRuntimeMs > 0
+        ? setTimeout(() => {
+          const err = new Error("FFmpeg max runtime exceeded");
+          logger.error("FFmpeg max runtime exceeded", {
+            jobId: options?.jobId,
+            input,
+            output,
+            maxRuntimeMs,
+            lastStderr: stderrBuffer.getLines(),
+          });
+          ffmpeg.kill("SIGKILL");
+          safeReject(err);
+        }, maxRuntimeMs)
+        : null;
 
     ffmpeg.on('close', (code) => {
       if (code === 0) safeResolve();
@@ -301,49 +319,6 @@ export function processVideo(
       logger.error('FFmpeg spawn error', { jobId: options?.jobId, error: err, input, output, lastStderr: stderrBuffer.getLines() });
       safeReject(err);
     });
-  });
-}
-
-/**
- * Generate a lightweight preview clip (first N seconds)
- * This replaces expensive HLS preview generation.
- */
-export function generatePreviewClip(
-  input: string,
-  output: string,
-  seconds: number = 8
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const ffmpeg = spawn(config.ffmpegPath, [
-      '-y',
-      '-nostdin',
-      ...LOCAL_INPUT_ARGS,
-      '-fflags', '+genpts',
-      '-i', input,
-      '-map', '0:v:0',
-      '-sn',
-      '-dn',
-
-      '-t', String(seconds),
-
-      '-vf', 'scale=-2:360',
-      '-pix_fmt', 'yuv420p', // ensures compatibility with more players
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '30',
-      '-movflags', '+faststart',
-      '-an', // no audio → saves CPU
-      '-threads', String(2),
-
-      output,
-    ]);
-
-    ffmpeg.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Preview generation failed: ${code}`));
-    });
-
-    ffmpeg.on('error', reject);
   });
 }
 
