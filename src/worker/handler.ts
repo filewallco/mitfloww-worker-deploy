@@ -1,327 +1,128 @@
-import { FileJob, JobStatus } from '../types';
-import { downloadFromR2, uploadJsonToR2, uploadToR2, upload, download } from "../utils/r2";
-// import { acquire, release } from './admission';
-import path from 'path';
-import fs from 'fs';
-import os from 'os';
-import { connection } from '../queue/connection';
-import { enqueueFile } from '../queue/enqueue';
-import { assertAllowedVideoProbe, inspectVideoInput, processVideo } from '../processors/video';
-import { getFreeDiskSpace } from '../utils/disk';
-import { config } from '../config';
-import { processImage } from '../processors/image';
-import { processPdf } from '../processors/pdf';
-import { spawn } from 'child_process';
-import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
-import { logger } from '../utils/logger';
-import { fileTypeFromFile } from 'file-type';
-import { assertAllowedMediaInput, assertDetectedMediaMatchesDeclaration, isLikelyMatroska, normalizeExtension } from '../utils/media';
-import { assertBasicFileHeader } from '../utils/fileSignature';
-import { toPublicErrorMessage } from '../security/errors';
+import fs from "fs";
+import path from "path";
+import { spawn } from "child_process";
+import { DelayedError, Job, UnrecoverableError } from "bullmq";
+import { fileTypeFromFile } from "file-type";
+import { config } from "../config";
+import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from "../constants";
+import { connection } from "../queue/connection";
+import { classify } from "../queue/priority";
+import { processImage } from "../processors/image";
+import { processPdf } from "../processors/pdf";
+import {
+  assertAllowedVideoProbe,
+  inspectVideoInput,
+  processVideo,
+} from "../processors/video";
+import { toPublicErrorMessage } from "../security/errors";
+import { FileJob, JobStatus } from "../types";
+import { assertBasicFileHeader } from "../utils/fileSignature";
+import { logger } from "../utils/logger";
+import {
+  assertAllowedMediaInput,
+  assertDetectedMediaMatchesDeclaration,
+  isLikelyMatroska,
+  normalizeExtension,
+} from "../utils/media";
+import {
+  download,
+  downloadFromR2,
+  headR2Object,
+  upload,
+  uploadJsonToR2,
+  uploadToR2,
+} from "../utils/r2";
+import { recordProcessingDuration } from "../utils/eta";
+import { buildTraceableWatermarkText } from "../utils/watermark";
+import {
+  CorruptInputError,
+  DiskUnavailableError,
+  DuplicateActiveFileVersionError,
+  ResourceUnavailableError,
+  ResourceWaitTimeoutError,
+  SourceMissingError,
+  TransientProcessingError,
+  WorkerCapacityExceededError,
+  WorkerError,
+} from "./errors";
+import {
+  canEverFitJob,
+  estimateRequiredDisk,
+  releaseCpuLane,
+  releaseDisk,
+  releaseUserSlot,
+  refreshReservations,
+  tryAcquireCpuLane,
+  tryAcquireUserSlot,
+  tryReserveDisk,
+  type CpuLane,
+} from "./resourceManager";
 
-const USER_ACTIVE_KEY = (userId: string) => `user:${userId}:active`;
 const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const LOCAL_PROTOCOL_ARGS = ['-safe', '1', '-protocol_whitelist', 'file,pipe'];
-
-/** Maximum concurrent active jobs per user */
-const ACQUIRE_USER_SLOT_LUA = `
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-local limit = tonumber(ARGV[1])
-
-if current < limit then
-  redis.call("INCR", KEYS[1])
-  redis.call("EXPIRE", KEYS[1], 60)
-  return 1
-else
-  return 0
-end
-`;
-
-/**
- * Acquire a user slot (blocking with retry)
- */
-async function acquireUserSlot(userId: string, limit: number): Promise<void> {
-  while (true) {
-    try {
-      const ok = await connection.eval(
-        ACQUIRE_USER_SLOT_LUA,
-        1,
-        USER_ACTIVE_KEY(userId),
-        limit
-      );
-
-      if (ok === 1) return;
-    } catch (e: any) {
-      const msg = e?.message || '';
-      logger.error('acquireUserSlot Redis error', { key: USER_ACTIVE_KEY(userId), error: e });
-      if (msg.includes('not an integer') || msg.includes('out of range')) {
-        try {
-          logger.warn('Resetting user active key to 0 due to invalid value', { key: USER_ACTIVE_KEY(userId) });
-          await connection.set(USER_ACTIVE_KEY(userId), '0');
-        } catch (e2) {
-          logger.error('Failed to reset user active key', { key: USER_ACTIVE_KEY(userId), error: e2 });
-        }
-      }
-    }
-
-    await new Promise(r => setTimeout(r, 100));
-  }
-}
-
-/**
- * Release a user slot
- */
-async function releaseUserSlot(userId: string): Promise<void> {
-  try {
-    const val = await connection.decr(USER_ACTIVE_KEY(userId));
-    if (val <= 0) await connection.del(USER_ACTIVE_KEY(userId));
-  } catch {}
-}
-
-function getCpuLimit(): number {
-  // 1. Respect explicit override
-  if (process.env.GLOBAL_CPU_LIMIT) {
-    return Number(process.env.GLOBAL_CPU_LIMIT);
-  }
-
-  // 2. Try Docker CPU quota (cgroup v2)
-  try {
-    const data = require('fs').readFileSync('/sys/fs/cgroup/cpu.max', 'utf8');
-    const [quota, period] = data.trim().split(' ');
-
-    if (quota !== 'max') {
-      return Math.max(1, Math.floor(Number(quota) / Number(period)));
-    }
-  } catch { }
-
-  // 3. Fallback to host cores
-  return os.cpus().length;
-}
-
-/**
- * GLOBAL CPU LIMITER
- *
- * Purpose:
- * Prevents total CPU oversubscription across all workers.
- * Even if per-queue concurrency is high, this enforces a hard global cap.
- *
- * Design:
- * - Uses Redis as a distributed semaphore
- * - Ensures correctness across multiple processes/containers
- *
- * NOTE:
- * - Keep this conservative (e.g., <= number of CPU cores)
- */
-const GLOBAL_CPU_LIMIT = getCpuLimit();
-const CPU_KEY = 'global:cpu';
-
-const ACQUIRE_CPU_LUA = `
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-local limit = tonumber(ARGV[1])
-
-if current < limit then
-  current = redis.call("INCR", KEYS[1])
-  redis.call("EXPIRE", KEYS[1], 60)
-  return 1
-else
-  return 0
-end
-`;
-
-/**
- * Acquire a CPU slot (blocking with retry)
- */
-async function acquireCpuSlot(): Promise<void> {
-  while (true) {
-    try {
-      const ok = await connection.eval(
-        ACQUIRE_CPU_LUA,
-        1,
-        CPU_KEY,
-        GLOBAL_CPU_LIMIT
-      );
-
-      if (ok === 1) return;
-    } catch (e: any) {
-      const msg = e?.message || '';
-      logger.error('acquireCpuSlot Redis error', { key: CPU_KEY, error: e });
-      if (msg.includes('not an integer') || msg.includes('out of range')) {
-        try {
-          logger.warn('Resetting CPU key to 0 due to invalid value', { key: CPU_KEY });
-          await connection.set(CPU_KEY, '0');
-        } catch (e2) {
-          logger.error('Failed to reset CPU key', { key: CPU_KEY, error: e2 });
-        }
-      }
-    }
-
-    await new Promise(r => setTimeout(r, 100));
-  }
-}
-
-/**
- * Release a CPU slot
- */
-async function releaseCpuSlot(): Promise<void> {
-  try {
-    const val = await connection.decr(CPU_KEY);
-    if (val <= 0) await connection.del(CPU_KEY);
-  } catch { }
-}
-
-/**
- * GLOBAL DISK RESERVATION TRACKER
- *
- * Problem:
- * Multiple workers may pass disk check simultaneously → crash later.
- *
- * Solution:
- * Reserve disk space in Redis BEFORE processing starts.
- * Guarantees system-wide disk safety.
- */
-const DISK_KEY = 'global:disk_reserved';
-
-const RESERVE_DISK_LUA = `
-local reserved = tonumber(redis.call("GET", KEYS[1]) or "0")
-local free = tonumber(ARGV[1])
-local required = tonumber(ARGV[2])
-
-if (free - reserved) >= required then
-  redis.call("INCRBY", KEYS[1], required)
-  redis.call("EXPIRE", KEYS[1], 60)
-  return 1
-else
-  return 0
-end
-`;
-
-/**
- * Reserve disk space (bytes)
- */
-async function reserveDisk(bytes: number): Promise<boolean> {
-  const free = getFreeDiskSpace();
-  try {
-    const ok = await connection.eval(
-      RESERVE_DISK_LUA,
-      1,
-      DISK_KEY,
-      free,
-      bytes
-    );
-
-    return ok === 1;
-  } catch (e: any) {
-    // Recover from corrupted numeric value in Redis (e.g., non-integer stored)
-    const msg = e?.message || '';
-    logger.error('Redis error during reserveDisk', { error: e, free, bytes });
-
-    if (msg.includes('not an integer') || msg.includes('out of range')) {
-      try {
-        logger.warn('Resetting disk reservation key to 0 to recover from invalid value', { key: DISK_KEY });
-        await connection.set(DISK_KEY, '0');
-        const ok2 = await connection.eval(
-          RESERVE_DISK_LUA,
-          1,
-          DISK_KEY,
-          free,
-          bytes
-        );
-        return ok2 === 1;
-      } catch (e2) {
-        logger.error('Retry reserveDisk failed', { error: e2 });
-        return false;
-      }
-    }
-
-    return false;
-  }
-}
-
-/**
- * Release reserved disk
- */
-async function releaseDisk(bytes: number): Promise<void> {
-  try {
-    const val = await connection.decrby(DISK_KEY, bytes);
-    if (val <= 0) await connection.del(DISK_KEY);
-  } catch (e) {
-    logger.error('releaseDisk failed', { error: e, key: DISK_KEY, bytes });
-  }
-}
-
-/**
- * Ensures file is fully written before processing/uploading.
- *
- * WHY:
- * - fs.watch fires BEFORE write completion
- * - Uploading partial .ts files causes:
- *   - corrupt HLS segments
- *   - broken playback
- *
- * STRATEGY:
- * - Poll file size until stable
- */
-async function waitForStableFile(filePath: string): Promise<void> {
-  let lastSize = -1;
-
-  while (true) {
-    try {
-      const stat = await fs.promises.stat(filePath);
-
-      if (stat.size === lastSize) break;
-
-      lastSize = stat.size;
-      await new Promise((r) => setTimeout(r, 200));
-
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        // File not ready yet → wait
-        await new Promise((r) => setTimeout(r, 200));
-        continue;
-      }
-      throw err;
-    }
-  }
-}
-
+const LOCK_TTL_MS = 60 * 60 * 1000;
+const FILE_VERSION_KEY_TTL_MS = 24 * 60 * 60 * 1000;
+const LOCAL_PROTOCOL_ARGS = ["-safe", "1", "-protocol_whitelist", "file,pipe"];
 const WORKER_ID = `${process.pid}-${Date.now()}`;
-const LOCK_TTL = 60 * 60 * 1000;
 
-/**
- * Determine the job category based on file size.
- * - 'small'  : <100 MB
- * - 'medium' : 100 MB – 500 MB
- * - 'large'  : >500 MB
- */
-function getType(size: number): 'small' | 'medium' | 'large' {
-  const MB = 1024 * 1024;
-  if (size < 100 * MB) return 'small';
-  if (size < 500 * MB) return 'medium';
-  return 'large';
+type HandleContext = {
+  bullJob?: Job<FileJob>;
+  token?: string;
+  startTime: number;
+  jobKey: string;
+};
+
+type SourceMetadata = {
+  expectedBytes: number | null;
+  sourceDescription: string;
+};
+
+function parseNumber(value: string | undefined): number | null {
+  if (!value) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
-/**
- * Centralized helper to update job metadata in Redis.
- * Updates status, stage, and any extra info (like progress, errors, output).
- * TTL of 24 hours is set to avoid stale data.
- *
- * @param jobId - Unique identifier of the job
- * @param status - Current JobStatus
- * @param stage - Current stage of processing
- * @param extra - Optional additional metadata
- */
+function isLikelyCorruptError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("invalid") ||
+    normalized.includes("unsupported") ||
+    normalized.includes("codec") ||
+    normalized.includes("file signature") ||
+    normalized.includes("mime and extension mismatch") ||
+    normalized.includes("does not contain a video stream") ||
+    normalized.includes("malformed") ||
+    normalized.includes("encrypted")
+  );
+}
+
+function isNoSpaceError(error: unknown): boolean {
+  const anyErr = error as any;
+  const message = String(anyErr?.message || "");
+  return anyErr?.code === "ENOSPC" || /no space left on device/i.test(message);
+}
+
+function maxAttempts(bullJob?: Job<FileJob>): number {
+  const attempts = Number(
+    bullJob?.opts?.attempts ?? config.processing.maxAttempts,
+  );
+  return Number.isFinite(attempts) && attempts > 0
+    ? attempts
+    : config.processing.maxAttempts;
+}
+
 async function updateJobStage(
   jobId: string,
   status: JobStatus,
   stage: string,
-  extra?: Record<string, any>
+  extra?: Record<string, unknown>,
 ) {
-  // Extract bullJob
   const { bullJob, ...safeExtra } = extra || {};
+  const job = bullJob as Job<FileJob> | undefined;
+  const progress = safeExtra.progress;
 
-  // Sync BullMQ progress
-  if (safeExtra?.progress !== undefined && bullJob) {
-    await bullJob.updateProgress(safeExtra.progress);
+  if (job && typeof progress === "number") {
+    await job.updateProgress(progress);
   }
 
   const payload = {
@@ -331,108 +132,21 @@ async function updateJobStage(
     updatedAt: Date.now(),
   };
 
-  /**
-   * Store metadata
-   */
-  await connection.hset(`job:${jobId}`, payload);
-
-  /**
-   * Append log entry (NEW)
-   * This allows UI timeline view
-   */
+  await connection.hset(REDIS_KEYS.JOB(jobId), payload);
   await connection.rpush(
-    `job:${jobId}:logs`,
+    REDIS_KEYS.JOB_LOGS(jobId),
     JSON.stringify({
       time: Date.now(),
-      stage,
       status,
+      stage,
       ...safeExtra,
-    })
+    }),
   );
-
-  /**
-   * Keep logs for 24h
-   */
-  await connection.expire(`job:${jobId}`, 60 * 60 * 24);
-  await connection.expire(`job:${jobId}:logs`, 60 * 60 * 24);
+  await connection.expire(REDIS_KEYS.JOB(jobId), 60 * 60 * 24);
+  await connection.expire(REDIS_KEYS.JOB_LOGS(jobId), 60 * 60 * 24);
 }
 
-function computeFileTTL(size: number): number {
-  const MB = 1024 * 1024;
-
-  const base = 5 * 60 * 1000; // 5 min
-  const per100MB = 2 * 60 * 1000;
-
-  return base + Math.ceil(size / (100 * MB)) * per100MB;
-}
-
-function computeVideoTTL(durationMs: number): number {
-  const MULTIPLIER = 2.5; // encoding + overhead
-  const BUFFER = 10 * 60 * 1000; // 10 min safety
-  const normalizedDurationMs =
-    Number.isFinite(durationMs) && durationMs > 0
-      ? durationMs
-      : 5 * 60 * 1000;
-
-  return Math.ceil(Math.max(
-    normalizedDurationMs * MULTIPLIER + BUFFER,
-    30 * 60 * 1000 // minimum 30 min
-  ));
-}
-
-async function materializeInputPath(
-  rawInputPath: string,
-  job: FileJob
-): Promise<{ inputPath: string; detectedExt: string | null; detectedMime: string | null }> {
-  const detected = await fileTypeFromFile(rawInputPath).catch(() => undefined);
-  const detectedExt = normalizeExtension(detected?.ext);
-
-  if (!detectedExt) {
-    return {
-      inputPath: rawInputPath,
-      detectedExt,
-      detectedMime: detected?.mime ?? null,
-    };
-  }
-
-  const resolvedPath = path.join(path.dirname(rawInputPath), `input${detectedExt}`);
-
-  if (resolvedPath !== rawInputPath) {
-    await fs.promises.rm(resolvedPath, { force: true });
-    await fs.promises.rename(rawInputPath, resolvedPath);
-  }
-
-  return {
-    inputPath: resolvedPath,
-    detectedExt,
-    detectedMime: detected?.mime ?? null,
-  };
-}
-
-/**
- * notifyCallback sends a POST request to the job's callback URL with the provided payload. It includes the job ID, file ID, and any additional information in the payload. The function also handles errors gracefully, logging any issues that occur during the callback attempt. This allows external services to be notified of job completion, progress updates, or failures in a standardized way.
- * @param job - The FileJob object containing metadata and callback information
- * @param payload - An object containing additional data to include in the callback request
- * The payload will be merged with the job's fileId and fileVersionId to provide context to the callback receiver.
- * If the job does not have a callback URL defined, the function will simply return without attempting to send a request.
- * Errors during the fetch operation are caught and logged, but do not throw exceptions to ensure that the main job processing flow is not disrupted by callback issues.
- * This function is essential for integrating the file processing system with external workflows, allowing for real-time notifications and updates based on job status changes.
- * Example usage:
- * notifyCallback(job, { status: 'completed', outputUrl: 'https://example.com/output.mp4' });
- * This would send a POST request to the job's callback URL with a JSON body containing the job ID, file ID, file version ID, status, and output URL.
- * The callback receiver can then use this information to take appropriate actions, such as updating a user interface, triggering additional processing, or sending notifications to users.
- * Overall, this function provides a flexible and robust mechanism for communicating job outcomes to external systems in a decoupled manner.
- * Note: Ensure that the callback URL is secure and that the callback token is used to authenticate requests to prevent unauthorized access.
- * The callback payload can be extended to include any relevant information about the job or its output, making it a powerful tool for integrating with various services and workflows.
- * The function is designed to be resilient, ensuring that even if the callback fails, it does not impact the main processing of the job, while still providing valuable logging for troubleshooting callback issues.
- * In summary, notifyCallback is a critical component for enabling communication between the file processing system and external services, allowing for dynamic and responsive workflows based on job events.
- * @param job - The FileJob object containing metadata and callback information
- * @param payload - An object containing additional data to include in the callback request
- * The payload will be merged with the job's fileId and fileVersionId to provide context to the callback receiver.
- * If the job does not have a callback URL defined, the function will simply return without attempting to send a request.
- * Errors during the fetch operation are caught and logged, but do not throw exceptions to ensure that the main job processing flow is not disrupted by callback issues.
- */
-async function notifyCallback(job: FileJob, payload: Record<string, any>) {
+async function notifyCallback(job: FileJob, payload: Record<string, unknown>) {
   if (!job.callbackUrl) return;
 
   await fetch(job.callbackUrl, {
@@ -448,342 +162,624 @@ async function notifyCallback(job: FileJob, payload: Record<string, any>) {
       ...payload,
     }),
   }).catch((error) => {
-    logger.error("Processing callback failed", {
-      jobId: job.fileId,
-      error,
-    });
+    logger.error("Processing callback failed", { jobId: job.fileId, error });
   });
 }
 
-/**
- * Main job handler.
- * Handles the lifecycle of a file job: downloading, processing, uploading,
- * retrying on failure, and optionally moving to DLQ.
- *
- * @param job - FileJob object with metadata and file info
- * @param bullJob - Optional BullMQ job reference (for progress & retries)
- */
-export async function handleJob(job: FileJob, bullJob?: any) {
-  if (!SAFE_JOB_ID.test(job.fileId)) {
-    throw new Error('Invalid job id');
+async function materializeInputPath(
+  rawInputPath: string,
+): Promise<{
+  inputPath: string;
+  detectedExt: string | null;
+  detectedMime: string | null;
+}> {
+  const detected = await fileTypeFromFile(rawInputPath).catch(() => undefined);
+  const detectedExt = normalizeExtension(detected?.ext);
+
+  if (!detectedExt) {
+    return {
+      inputPath: rawInputPath,
+      detectedExt: null,
+      detectedMime: detected?.mime ?? null,
+    };
   }
 
-  /**
-   * Use controlled temp directory instead of OS temp
-   * Prevents hidden temp files and debugging issues
-   */
+  const resolvedPath = path.join(
+    path.dirname(rawInputPath),
+    `input${detectedExt}`,
+  );
+  if (resolvedPath !== rawInputPath) {
+    await fs.promises.rm(resolvedPath, { force: true });
+    await fs.promises.rename(rawInputPath, resolvedPath);
+  }
+
+  return {
+    inputPath: resolvedPath,
+    detectedExt,
+    detectedMime: detected?.mime ?? null,
+  };
+}
+
+async function resolveSourceMetadata(job: FileJob): Promise<SourceMetadata> {
+  if (job.sourceBucket && job.sourceKey) {
+    const head = await headR2Object({
+      bucket: job.sourceBucket,
+      key: job.sourceKey,
+    });
+    if (!head) {
+      throw new SourceMissingError("Source object not found in R2");
+    }
+
+    if (
+      !Number.isFinite(head.contentLength) ||
+      (head.contentLength as number) <= 0
+    ) {
+      throw new SourceMissingError("Source object size is unavailable");
+    }
+
+    const expectedBytes = Number(head.contentLength);
+    if (expectedBytes > config.security.maxUploadBytes) {
+      throw new WorkerCapacityExceededError(
+        "capacity_exceeded",
+        `Source object exceeds max upload size: ${expectedBytes}`,
+        "File is too large for the current worker capacity",
+      );
+    }
+
+    return {
+      expectedBytes,
+      sourceDescription: `r2://${job.sourceBucket}/${job.sourceKey}`,
+    };
+  }
+
+  if (job.inputUrl) {
+    if (!Number.isFinite(job.size) || job.size <= 0) {
+      throw new SourceMissingError("Input size is missing for URL source");
+    }
+
+    return {
+      expectedBytes: job.size,
+      sourceDescription: job.inputUrl,
+    };
+  }
+
+  throw new SourceMissingError("Missing source object");
+}
+
+function normalizeError(error: unknown): Error {
+  if (error instanceof WorkerError) return error;
+  if (error instanceof DelayedError) return error;
+  if (error instanceof UnrecoverableError) return error;
+
+  const anyErr = error as any;
+  const message = String(anyErr?.message || "Processing failed");
+
+  if (isNoSpaceError(error)) {
+    return new DiskUnavailableError();
+  }
+
+  if (
+    message.includes("Download failed: 404") ||
+    /source object not found/i.test(message) ||
+    /nosuchkey/i.test(message)
+  ) {
+    return new SourceMissingError(message);
+  }
+
+  if (
+    message.includes("maximum upload size") ||
+    message.includes("allowed size") ||
+    message.includes("exceeds expected content length")
+  ) {
+    return new WorkerCapacityExceededError(
+      "capacity_exceeded",
+      message,
+      "File is too large for the current worker capacity",
+    );
+  }
+
+  if (isLikelyCorruptError(message)) {
+    return new CorruptInputError(message);
+  }
+
+  return new TransientProcessingError(message);
+}
+
+async function scheduleResourceWait(
+  job: FileJob,
+  waitError: ResourceUnavailableError,
+  context: HandleContext,
+) {
+  const now = Date.now();
+  const meta = await connection.hgetall(context.jobKey);
+
+  const previousFirstWaitAt = parseNumber(meta.firstResourceWaitAt);
+  const firstWaitAt =
+    previousFirstWaitAt && previousFirstWaitAt > 0 && previousFirstWaitAt <= now
+      ? previousFirstWaitAt
+      : now;
+
+  const previousResourceWaitCount = parseNumber(meta.resourceWaitCount);
+  const resourceWaitCount =
+    previousFirstWaitAt &&
+    previousFirstWaitAt > 0 &&
+    previousResourceWaitCount &&
+    previousResourceWaitCount > 0
+      ? previousResourceWaitCount + 1
+      : 1;
+
+  const waitedMs = Math.max(0, now - firstWaitAt);
+
+  if (
+    resourceWaitCount > config.processing.maxResourceWaitCount ||
+    waitedMs > config.processing.maxResourceWaitMs
+  ) {
+    throw new ResourceWaitTimeoutError();
+  }
+
+  const nextRetryAt = now + config.processing.resourceRetryDelayMs;
+  const nextStatus =
+    (context.bullJob?.attemptsMade ?? 0) > 0
+      ? JOB_STATUS.RETRYING
+      : JOB_STATUS.QUEUED;
+
+  await updateJobStage(job.fileId, nextStatus, waitError.stage, {
+    waitReason: waitError.waitReason,
+    resourceWaitCount,
+    firstResourceWaitAt: firstWaitAt,
+    nextRetryAt,
+    attemptsMade: context.bullJob?.attemptsMade ?? 0,
+    maxAttempts: maxAttempts(context.bullJob),
+    bullJob: context.bullJob,
+  });
+
+  if (job.fileVersionId) {
+    const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(job.fileVersionId);
+    const queuedOwner = await connection.get(queuedKey);
+    if (queuedOwner === job.fileId) {
+      await connection.pexpire(queuedKey, FILE_VERSION_KEY_TTL_MS);
+    }
+  }
+
+  if (context.bullJob && context.token) {
+    await context.bullJob.moveToDelayed(nextRetryAt, context.token);
+    throw new DelayedError("resource_wait");
+  }
+
+  throw waitError;
+}
+
+async function updateFailedState(
+  job: FileJob,
+  err: WorkerError | Error,
+  context: HandleContext,
+  failureStatus: JobStatus,
+) {
+  const publicMessage =
+    err instanceof WorkerError
+      ? err.publicMessage
+      : toPublicErrorMessage(err.message);
+  const errorCode =
+    err instanceof WorkerError ? err.code : "transient_processing_failure";
+
+  await updateJobStage(job.fileId, failureStatus, JOB_STAGE.FAILED, {
+    error: publicMessage,
+    errorCode,
+    failedAt: Date.now(),
+    attemptsMade: context.bullJob?.attemptsMade ?? 0,
+    maxAttempts: maxAttempts(context.bullJob),
+    success: false,
+    bullJob: context.bullJob,
+  });
+}
+
+async function removeTempForResourceWait(
+  jobId: string,
+  jobKey: string,
+  tempDir: string,
+): Promise<boolean> {
+  try {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+    await connection.hdel(jobKey, "tempDir", "tempCleanupEligibleAt");
+    logger.info("Removed temp dir for resource wait", { jobId, tempDir });
+    return true;
+  } catch (error) {
+    logger.error("Failed to remove temp dir for resource wait", {
+      jobId,
+      tempDir,
+      error,
+    });
+    return false;
+  }
+}
+
+export async function handleJob(
+  job: FileJob,
+  bullJob?: Job<FileJob>,
+  token?: string,
+) {
+  if (!SAFE_JOB_ID.test(job.fileId)) {
+    throw new Error("Invalid job id");
+  }
+
+  if (!Number.isFinite(job.size) || job.size <= 0) {
+    throw new Error("Invalid job size");
+  }
+
+  const startTime = Date.now();
   const tempDir = path.join(config.tempDir, job.fileId);
-  const rawInputPath = path.join(tempDir, 'input');
-  const outputBase = path.join(tempDir, 'output');
+  const rawInputPath = path.join(tempDir, "input");
+  const outputBase = path.join(tempDir, "output");
   const lockKey = REDIS_KEYS.LOCK(job.fileId);
   const jobKey = REDIS_KEYS.JOB(job.fileId);
-  /**
-   * IDEMPOTENCY LOCK (CRITICAL)
-   * Prevent duplicate execution
-   * 
-   * STEP 1: Acquire idempotency lock (LONG TTL)
-   */
-  const acquiredLock = await connection.set(
-    lockKey,
-    WORKER_ID,
-    'PX',
-    LOCK_TTL,
-    'NX'
-  );
+  const context: HandleContext = { bullJob, token, startTime, jobKey };
+  const userId = job.userId || "local-user";
+  const cpuLane: CpuLane = (() => {
+    if (job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF) {
+      return "image";
+    }
 
-  if (acquiredLock !== 'OK') {
-    logger.info('Skipping duplicate execution', { jobId: job.fileId });
-    return;
-  }
-  logger.info('LOCK ACQUIRED', { jobId: job.fileId, worker: WORKER_ID });
+    if (job.fileType === FILE_TYPE.VIDEO) {
+      const sizeType = classify(job.size);
 
-  logger.info('Job started', { jobId: job.fileId, userId: job.userId, fileType: job.fileType });
-  const userId = job.userId || 'local-user';
-  const startTime = Date.now();
+      if (sizeType === "small") return "small";
+      if (sizeType === "medium") return "medium";
+      return "heavy";
+    }
+
+    return "small";
+  })();
+  const watermarkText = buildTraceableWatermarkText({
+    userEmail: job.userEmail,
+    userName: job.userName,
+    fileVersionId: job.fileVersionId,
+  });
+
   let heartbeat: NodeJS.Timeout | null = null;
-  let userSlotAcquired = false;
+  let jobStatus: JobStatus = JOB_STATUS.PROCESSING;
   let diskReserved = false;
-  let reservedDisk = 0;
-  let cpuSlotHeld = false;
-  let outputPath = '';
+  let userSlotHeld = false;
+  let fileVersionSlotHeld = false;
+  let clearQueuedFileVersionIndex = false;
+  let outputPath = "";
   let safeInput = rawInputPath;
   let videoDurationMs: number | null = null;
-  let jobStatus: JobStatus = JOB_STATUS.PROCESSING;
-
-  const acquireLocalCpuSlot = async () => {
-    if (cpuSlotHeld) return;
-    await acquireCpuSlot();
-    cpuSlotHeld = true;
-  };
-
-  const releaseLocalCpuSlot = async () => {
-    if (!cpuSlotHeld) return;
-    await releaseCpuSlot();
-    cpuSlotHeld = false;
-  };
+  let expectedSourceBytes: number | null = null;
+  let tempDirCreated = false;
+  let cpuHeavyTaskActive = false;
+  let tempRemovedForResourceWait = false;
 
   const withCpuSlot = async <T>(task: () => Promise<T>): Promise<T> => {
-    await acquireLocalCpuSlot();
+    const acquired = await tryAcquireCpuLane(job.fileId, cpuLane);
+
+    if (!acquired) {
+      throw new ResourceUnavailableError(
+        `${cpuLane} CPU slot unavailable`,
+        JOB_STAGE.WAITING_FOR_CPU,
+        `${cpuLane}_cpu_slot_unavailable`,
+      );
+    }
+
     try {
+      cpuHeavyTaskActive = true;
       return await task();
     } finally {
-      await releaseLocalCpuSlot();
+      cpuHeavyTaskActive = false;
+
+      try {
+        await releaseCpuLane(job.fileId, cpuLane);
+      } catch (error) {
+        logger.error("Failed to release CPU slot", {
+          jobId: job.fileId,
+          cpuLane,
+          error,
+        });
+      }
     }
   };
 
+  const lockResult = await connection.set(
+    lockKey,
+    WORKER_ID,
+    "PX",
+    LOCK_TTL_MS,
+    "NX",
+  );
+  if (lockResult !== "OK") {
+    logger.info("Skipping duplicate execution", { jobId: job.fileId });
+    return;
+  }
+
   try {
-    /**
-     * PER-USER LIMIT
-     */
-    const limit = config.userLimits[job.userTier] || 2;
+    if (job.fileVersionId) {
+      const activeKey = REDIS_KEYS.ACTIVE_FILE_VERSION(job.fileVersionId);
+      const activeSet = await connection.set(
+        activeKey,
+        job.fileId,
+        "PX",
+        LOCK_TTL_MS,
+        "NX",
+      );
+      if (activeSet !== "OK") {
+        const owner = await connection.get(activeKey);
+        if (owner && owner !== job.fileId) {
+          throw new DuplicateActiveFileVersionError();
+        }
+        await connection.pexpire(activeKey, LOCK_TTL_MS);
+      }
+      fileVersionSlotHeld = true;
+    }
 
-    await acquireUserSlot(userId, limit);
-    userSlotAcquired = true;
+    const declaredInputValue =
+      job.sourceKey ?? job.inputUrl ?? job.originalName ?? job.outputKey;
 
-    /**
-     * STEP 3: Prepare temp dir BEFORE download
-     */
-    await fs.promises.mkdir(tempDir, { recursive: true });
+    assertAllowedMediaInput(
+      job.fileType,
+      job.mimeType ?? null,
+      declaredInputValue,
+    );
+    assertAllowedMediaInput(job.fileType, null, job.outputKey);
 
-    /**
-     * Ensure job has initial state without overwriting enqueue metadata
-     */
+    const source = await resolveSourceMetadata(job);
+    expectedSourceBytes = source.expectedBytes;
+
+    const requiredDisk = estimateRequiredDisk(
+      job,
+      expectedSourceBytes ?? job.size,
+    );
     await connection.hset(jobKey, {
-      status: JOB_STATUS.PROCESSING,
-      stage: JOB_STAGE.STARTING,
-      startedAt: startTime,
+      requiredDisk,
+      sourceBytes: expectedSourceBytes ?? job.size,
     });
 
-    /** Stage 1: Downloading the input file */
-    await updateJobStage(job.fileId, jobStatus, JOB_STAGE.DOWNLOADING, {
-      startedAt: startTime,
-      bullJob,
-    });
+    if (!canEverFitJob(requiredDisk)) {
+      throw new WorkerCapacityExceededError(
+        "capacity_exceeded",
+        `Job requires ${requiredDisk} bytes but worker cannot fit this size`,
+        "File is too large for the current worker capacity",
+      );
+    }
 
-    /**
-     * STEP 4: Download input to local temp path
-     */
+    diskReserved = await tryReserveDisk(job.fileId, requiredDisk);
+    if (!diskReserved) {
+      throw new DiskUnavailableError();
+    }
+
+    await updateJobStage(
+      job.fileId,
+      JOB_STATUS.PROCESSING,
+      JOB_STAGE.RESERVED,
+      {
+        requiredDisk,
+        sourceBytes: expectedSourceBytes ?? job.size,
+        waitReason: "",
+        nextRetryAt: "",
+        attemptsMade: bullJob?.attemptsMade ?? 0,
+        maxAttempts: maxAttempts(bullJob),
+        bullJob,
+      },
+    );
+
+    const userLimit = config.userLimits[job.userTier] || config.userLimits.free;
+    userSlotHeld = await tryAcquireUserSlot(userId, job.fileId, userLimit);
+    if (!userSlotHeld) {
+      throw new ResourceUnavailableError(
+        "User slot unavailable",
+        JOB_STAGE.WAITING_FOR_USER_SLOT,
+        "user_slot_unavailable",
+      );
+    }
+
+    await fs.promises.mkdir(tempDir, { recursive: true });
+    tempDirCreated = true;
+    await updateJobStage(
+      job.fileId,
+      JOB_STATUS.PROCESSING,
+      JOB_STAGE.VALIDATING,
+      {
+        startedAt: startTime,
+        heartbeatAt: Date.now(),
+        waitReason: "",
+        nextRetryAt: "",
+        attemptsMade: bullJob?.attemptsMade ?? 0,
+        maxAttempts: maxAttempts(bullJob),
+        bullJob,
+      },
+    );
+
+    heartbeat = setInterval(async () => {
+      try {
+        const owner = await connection.get(lockKey);
+        if (owner !== WORKER_ID) return;
+
+        await connection.pexpire(lockKey, LOCK_TTL_MS);
+        if (job.fileVersionId) {
+          await connection.pexpire(
+            REDIS_KEYS.ACTIVE_FILE_VERSION(job.fileVersionId),
+            LOCK_TTL_MS,
+          );
+          const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(job.fileVersionId);
+          const queuedOwner = await connection.get(queuedKey);
+          if (queuedOwner === job.fileId) {
+            await connection.pexpire(queuedKey, FILE_VERSION_KEY_TTL_MS);
+          }
+        }
+        await refreshReservations(job.fileId);
+        await connection.hset(jobKey, {
+          heartbeatAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      } catch (error) {
+        logger.error("Heartbeat error", { jobId: job.fileId, error });
+      }
+    }, 60_000);
+
+    await updateJobStage(
+      job.fileId,
+      JOB_STATUS.PROCESSING,
+      JOB_STAGE.DOWNLOADING,
+      {
+        source: source.sourceDescription,
+        bullJob,
+      },
+    );
+
     if (job.sourceBucket && job.sourceKey) {
       await downloadFromR2({
         bucket: job.sourceBucket,
         key: job.sourceKey,
         dest: rawInputPath,
+        expectedBytes: expectedSourceBytes,
+        maxBytes: config.security.maxUploadBytes,
       });
     } else if (job.inputUrl) {
-      await download(job.inputUrl, rawInputPath);
+      await download(job.inputUrl, rawInputPath, {
+        expectedBytes: expectedSourceBytes,
+        maxBytes: config.security.maxUploadBytes,
+      });
     } else {
-      throw new Error("Missing source object.");
+      throw new SourceMissingError("Missing source object");
     }
 
-    const materializedInput = await materializeInputPath(rawInputPath, job);
-    safeInput = materializedInput.inputPath;
-    const declaredInputValue =
-      job.sourceKey ??
-      job.inputUrl ??
-      job.originalName ??
-      job.outputKey;
+    const materialized = await materializeInputPath(rawInputPath);
+    safeInput = materialized.inputPath;
 
     assertDetectedMediaMatchesDeclaration(
       job.fileType,
       declaredInputValue,
-      materializedInput.detectedMime,
-      materializedInput.detectedExt,
+      materialized.detectedMime,
+      materialized.detectedExt,
     );
     await assertBasicFileHeader(
       safeInput,
-      materializedInput.detectedMime,
-      materializedInput.detectedExt
+      materialized.detectedMime,
+      materialized.detectedExt,
     );
 
     const downloadedSize = (await fs.promises.stat(safeInput)).size;
-
-    if (downloadedSize > job.size || downloadedSize > config.security.maxUploadBytes) {
-      throw new Error('Downloaded file exceeds allowed size');
+    if (downloadedSize > config.security.maxUploadBytes) {
+      throw new WorkerCapacityExceededError(
+        "capacity_exceeded",
+        `Downloaded file exceeds max upload size: ${downloadedSize}`,
+      );
     }
 
-    /**
-     * Probe the downloaded asset so we can fail early on obviously invalid inputs
-     * and make container normalization decisions without depending on the temp filename.
-     */
-    let videoProbe:
-      | ReturnType<typeof inspectVideoInput>
-      | null = null;
+    if (expectedSourceBytes && downloadedSize > expectedSourceBytes) {
+      throw new WorkerCapacityExceededError(
+        "capacity_exceeded",
+        `Downloaded bytes exceed expected source size: ${downloadedSize} > ${expectedSourceBytes}`,
+      );
+    }
+
+    let videoProbe: ReturnType<typeof inspectVideoInput> | null = null;
 
     if (job.fileType === FILE_TYPE.VIDEO) {
-      try {
+      await withCpuSlot(async () => {
         videoProbe = inspectVideoInput(safeInput);
-      } catch (probeErr) {
-        logger.warn('VIDEO PROBE FAILED', { jobId: job.fileId, error: probeErr });
-      }
+        assertAllowedVideoProbe(videoProbe!);
 
-      if (!videoProbe) {
-        throw new Error('Unable to inspect video metadata');
-      }
-
-      if (!videoProbe.hasVideo) {
-        throw new Error('Input file does not contain a video stream');
-      }
-
-      /**
-       * Remux Matroska inputs when possible, but never make that a hard dependency.
-       * Some MKV files contain codecs that cannot be copied into MP4 cleanly.
-       */
-      const isMatroskaInput = isLikelyMatroska({
-        formatName: videoProbe?.formatName,
-        mime: materializedInput.detectedMime,
-        ext: materializedInput.detectedExt,
-      });
-
-      if (isMatroskaInput) {
-        const remuxed = path.join(tempDir, 'remux.mp4');
-
-        try {
-          await withCpuSlot(
-            () =>
-              new Promise<void>((resolve, reject) => {
-                const ff = spawn(config.ffmpegPath, [
-                  '-y',
-                  '-nostdin',
-                  ...LOCAL_PROTOCOL_ARGS,
-                  '-fflags', '+genpts',
-                  '-i', safeInput,
-                  '-map', '0:v:0',
-                  '-map', '0:a:0?',
-                  '-sn',
-                  '-dn',
-                  '-c', 'copy',
-                  remuxed,
-                ]);
-
-                ff.on('close', (code) => {
-                  if (code === 0) resolve();
-                  else reject(new Error(`MKV remux failed with code ${code}`));
-                });
-                ff.on('error', reject);
-              })
+        if (!videoProbe!.hasVideo) {
+          throw new CorruptInputError(
+            "Input file does not contain a video stream",
           );
+        }
 
-          safeInput = remuxed;
+        const isMatroskaInput = isLikelyMatroska({
+          formatName: videoProbe!.formatName,
+          mime: materialized.detectedMime,
+          ext: materialized.detectedExt,
+        });
 
+        if (isMatroskaInput) {
+          const remuxed = path.join(tempDir, "remux.mp4");
           try {
+            await new Promise<void>((resolve, reject) => {
+              const ff = spawn(config.ffmpegPath, [
+                "-y",
+                "-nostdin",
+                ...LOCAL_PROTOCOL_ARGS,
+                "-fflags",
+                "+genpts",
+                "-i",
+                safeInput,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-sn",
+                "-dn",
+                "-c",
+                "copy",
+                remuxed,
+              ]);
+
+              ff.on("close", (code) => {
+                if (code === 0) resolve();
+                else reject(new Error(`MKV remux failed with code ${code}`));
+              });
+              ff.on("error", reject);
+            });
+            safeInput = remuxed;
             videoProbe = inspectVideoInput(safeInput);
-          } catch (probeErr) {
-            logger.warn('REMUX PROBE FAILED, keeping remuxed input', { jobId: job.fileId, error: probeErr });
+          } catch (error) {
+            logger.warn("MKV remux skipped; fallback to direct decode", {
+              jobId: job.fileId,
+              error,
+            });
           }
-        } catch (remuxErr) {
-          logger.warn('MKV REMUX SKIPPED, falling back to direct decode', { jobId: job.fileId, error: remuxErr });
         }
-      }
 
-      if (!videoProbe) {
-        throw new Error('Unable to inspect video metadata');
-      }
-
-      assertAllowedMediaInput(job.fileType, materializedInput.detectedMime, declaredInputValue);
-      if (!videoProbe.hasVideo) {
-        throw new Error('Input file does not contain a video stream');
-      }
-      assertAllowedVideoProbe(videoProbe);
+        videoDurationMs = videoProbe!.durationMs ?? null;
+      });
     }
 
-    /**
-     * Calculate required disk:
-     * - 2x file size (input + output)
-     * - minimum 500MB safety buffer
-     */
-    reservedDisk = Math.max(job.size * 2, 500 * 1024 * 1024);
-
-    /**
-     * Persist exact reservation value.
-     * CRITICAL: This must be used during release to prevent drift.
-     */
-    await connection.hset(jobKey, {
-      reservedDisk,
-    });
-
-    /**
-     * Attempt to reserve disk atomically
-     */
-    diskReserved = await reserveDisk(reservedDisk);
-
-    if (!diskReserved) {
-      throw new Error('Global disk reservation failed (insufficient space)');
-    }
-
-    /**
-     * STEP 5: Compute accurate TTL AFTER download
-     */
-    let ttl = computeFileTTL(job.size);
-
-    if (job.fileType === FILE_TYPE.VIDEO) {
-      /**
-       * SAFELY extract duration after any container normalization
-       */
-      videoDurationMs = videoProbe?.durationMs ?? 5 * 60 * 1000;
-
-      ttl = computeVideoTTL(videoDurationMs);
-    }
-
-    const lockTtlMs = Number.isFinite(ttl)
-      ? Math.max(Math.ceil(ttl), LOCK_TTL)
-      : LOCK_TTL;
-
-    await connection.pexpire(lockKey, lockTtlMs);
-
-    // HEARTBEAT
-    heartbeat = setInterval(async () => {
-      try {
-        const owner = await connection.get(lockKey);
-
-        if (owner === WORKER_ID) {
-          await connection.pexpire(lockKey, LOCK_TTL);
-
-          await connection.hset(jobKey, {
-            status: JOB_STATUS.PROCESSING,
-            updatedAt: Date.now(),
-            heartbeatAt: Date.now(),
-          });
-        } else if (heartbeat) {
-          logger.warn('Lost lock ownership', { jobId: job.fileId });
-          clearInterval(heartbeat);
-          heartbeat = null;
-        }
-      } catch (err) {
-        logger.error('Heartbeat error', { jobId: job.fileId, error: err });
-      }
-    }, 60_000);
-
-    /** Stage 2: Processing */
-    await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING);
+    await updateJobStage(
+      job.fileId,
+      JOB_STATUS.PROCESSING,
+      JOB_STAGE.PROCESSING,
+      {
+        progress: 0,
+        waitReason: "",
+        nextRetryAt: "",
+        bullJob,
+      },
+    );
 
     if (job.fileType === FILE_TYPE.IMAGE) {
-      const result = await withCpuSlot(() => processImage(safeInput, outputBase));
+      const result = await withCpuSlot(() =>
+        processImage(safeInput, outputBase, {
+          watermarkText,
+        }),
+      );
       outputPath = result.outputPath;
-
       job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
-      await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING, {
-        progress: 100,
-        bullJob,
-      });
+      await updateJobStage(
+        job.fileId,
+        JOB_STATUS.PROCESSING,
+        JOB_STAGE.PROCESSING,
+        {
+          progress: 100,
+          bullJob,
+        },
+      );
     } else if (job.fileType === FILE_TYPE.PDF) {
-      const result = await withCpuSlot(() => processPdf(safeInput, outputBase));
+      const result = await withCpuSlot(() =>
+        processPdf(safeInput, outputBase, {
+          watermarkText,
+        }),
+      );
       outputPath = result.outputPath;
-
       job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
-      await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING, {
-        progress: 100,
-        bullJob,
-      });
+      await updateJobStage(
+        job.fileId,
+        JOB_STATUS.PROCESSING,
+        JOB_STAGE.PROCESSING,
+        {
+          progress: 100,
+          bullJob,
+        },
+      );
     } else if (job.fileType === FILE_TYPE.VIDEO) {
-      /**
-       * Full watermarked video processing.
-       *
-       * In Mitfloww, this is the customer preview:
-       * - full duration
-       * - watermarked
-       * - uploaded as processed file
-       * - shown to client for review/update requests
-       */
       const finalOutput = `${outputBase}.mp4`;
       let lastProgress = -1;
       let lastProgressAt = 0;
@@ -792,21 +788,22 @@ export async function handleJob(job: FileJob, bullJob?: any) {
         processVideo(
           safeInput,
           finalOutput,
-          videoDurationMs
-            ? { totalDuration: videoDurationMs, jobId: job.fileId }
-            : { jobId: job.fileId },
+          {
+            totalDuration: videoDurationMs ?? undefined,
+            jobId: job.fileId,
+            width: videoProbe?.width ?? null,
+            height: videoProbe?.height ?? null,
+            watermarkText,
+          },
           (progress) => {
             const normalized = Math.max(0, Math.min(Math.round(progress), 100));
             const now = Date.now();
-
             if (normalized < 100) {
               if (normalized <= lastProgress) return;
               if (now - lastProgressAt < 750) return;
             }
-
             lastProgress = normalized;
             lastProgressAt = now;
-
             void updateJobStage(
               job.fileId,
               JOB_STATUS.PROCESSING,
@@ -815,57 +812,64 @@ export async function handleJob(job: FileJob, bullJob?: any) {
                 progress: normalized,
                 bullJob,
               },
-            ).catch((progressErr) => {
+            ).catch((progressError) => {
               logger.error("Progress update failed", {
                 jobId: job.fileId,
-                error: progressErr,
+                error: progressError,
               });
             });
           },
-        )
+        ),
       );
 
-      await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.PROCESSING, {
-        progress: 100,
-        bullJob,
-      });
-
+      await updateJobStage(
+        job.fileId,
+        JOB_STATUS.PROCESSING,
+        JOB_STAGE.PROCESSING,
+        {
+          progress: 100,
+          bullJob,
+        },
+      );
       outputPath = finalOutput;
+    } else {
+      throw new CorruptInputError(`Unsupported file type: ${job.fileType}`);
     }
 
-    /** Stage 3: Uploading the processed file */
-    await updateJobStage(job.fileId, JOB_STATUS.PROCESSING, JOB_STAGE.UPLOADING);
-    /**
-     * Wait for file to be fully written before upload (important for videos)
-     */
-    let result: {
-        bucket?: string;
-        key?: string;
-        sizeBytes?: number;
-        contentType?: string;
-      } | string;
+    await updateJobStage(
+      job.fileId,
+      JOB_STATUS.UPLOADING,
+      JOB_STAGE.UPLOADING,
+      {
+        bullJob,
+      },
+    );
 
-      if (job.outputBucket) {
-        const uploaded = await uploadToR2({
+    const result = job.outputBucket
+      ? await uploadToR2({
           bucket: job.outputBucket,
           key: job.outputKey,
           filePath: outputPath,
-        });
+          holderId: `${job.fileId}:upload`,
+        })
+      : await upload(outputPath, job.outputKey, `${job.fileId}:upload`);
 
-        result = uploaded;
-      } else {
-        result = await upload(outputPath, job.outputKey);
-      }
-
-    /** Job successfully completed */
     jobStatus = JOB_STATUS.COMPLETED;
-    await updateJobStage(job.fileId, jobStatus, JOB_STAGE.DONE, {
+    clearQueuedFileVersionIndex = true;
+    const durationMs = Date.now() - startTime;
+    await updateJobStage(job.fileId, JOB_STATUS.COMPLETED, JOB_STAGE.DONE, {
       completedAt: Date.now(),
-      duration: Date.now() - startTime,
+      duration: durationMs,
       output: result,
       success: true,
       bullJob,
     });
+
+    await recordProcessingDuration(
+      job.fileType,
+      expectedSourceBytes ?? job.size,
+      durationMs,
+    );
 
     const processedResult =
       typeof result === "string"
@@ -874,20 +878,26 @@ export async function handleJob(job: FileJob, bullJob?: any) {
             key: job.outputKey,
             mimeType: job.mimeType || "application/octet-stream",
             extension: path.extname(job.outputKey),
-            sizeBytes: outputPath ? (await fs.promises.stat(outputPath)).size : 0,
+            sizeBytes: outputPath
+              ? (await fs.promises.stat(outputPath)).size
+              : 0,
           }
         : {
             bucket: result.bucket || job.outputBucket || "",
             key: result.key || job.outputKey,
-            mimeType: result.contentType || job.mimeType || "application/octet-stream",
+            mimeType:
+              result.contentType || job.mimeType || "application/octet-stream",
             extension: path.extname(result.key || job.outputKey),
             sizeBytes: result.sizeBytes || 0,
           };
 
     let logObject: { bucket: string; key: string } | null = null;
-
     if (job.outputBucket && job.logKey) {
-      const logsRaw = await connection.lrange(REDIS_KEYS.JOB_LOGS(job.fileId), 0, -1);
+      const logsRaw = await connection.lrange(
+        REDIS_KEYS.JOB_LOGS(job.fileId),
+        0,
+        -1,
+      );
       const logs = logsRaw.map((line) => {
         try {
           return JSON.parse(line);
@@ -912,144 +922,203 @@ export async function handleJob(job: FileJob, bullJob?: any) {
       processed: processedResult,
       log: logObject,
     });
+  } catch (rawError) {
+    if (rawError instanceof DelayedError) {
+      throw rawError;
+    }
 
-  } catch (err: any) {
-    logger.error('JOB FAILED', { jobId: job.fileId, error: err, attempts: bullJob?.attemptsMade });
-    // Determine if the job can still be retried
-    const isRetrying = bullJob && bullJob.attemptsMade < (bullJob.opts.attempts || 1);
-    jobStatus = isRetrying ? JOB_STATUS.RETRYING : JOB_STATUS.FAILED;
-    const MAX_TOTAL_RETRIES = 5;
+    const normalized = normalizeError(rawError);
 
-    /** Update failed state in Redis */
-    await updateJobStage(job.fileId, jobStatus, JOB_STAGE.FAILED, {
-      error: toPublicErrorMessage(err?.message),
-      failedAt: Date.now(),
-      attemptsMade: bullJob?.attemptsMade || 0,
-      maxAttempts: bullJob?.opts.attempts || 1,
-      success: false,
-      bullJob,
-    });
+    if (normalized instanceof ResourceUnavailableError) {
+      if (tempDirCreated && !cpuHeavyTaskActive) {
+        tempRemovedForResourceWait = await removeTempForResourceWait(
+          job.fileId,
+          jobKey,
+          tempDir,
+        );
+      }
 
-    if (!isRetrying) {
+      try {
+        await scheduleResourceWait(job, normalized, context);
+      } catch (scheduleError) {
+        if (scheduleError instanceof ResourceWaitTimeoutError) {
+          jobStatus = JOB_STATUS.FAILED;
+          clearQueuedFileVersionIndex = true;
+          await updateFailedState(
+            job,
+            scheduleError,
+            context,
+            JOB_STATUS.FAILED,
+          );
+          await notifyCallback(job, {
+            status: "failed",
+            errorCode: scheduleError.code,
+            errorMessage: scheduleError.publicMessage,
+          });
+          throw new UnrecoverableError(scheduleError.publicMessage);
+        }
+        throw scheduleError;
+      }
+      throw new DelayedError("resource_wait");
+    }
+
+    if (normalized instanceof ResourceWaitTimeoutError) {
+      jobStatus = JOB_STATUS.FAILED;
+      clearQueuedFileVersionIndex = true;
+      await updateFailedState(job, normalized, context, JOB_STATUS.FAILED);
       await notifyCallback(job, {
-        status:
-          toPublicErrorMessage(err?.message) === "Invalid or unsupported media file"
-            ? "corrupt"
-            : "failed",
+        status: "failed",
+        errorCode: normalized.code,
+        errorMessage: normalized.publicMessage,
+      });
+      throw new UnrecoverableError(normalized.publicMessage);
+    }
+
+    if (
+      normalized instanceof WorkerCapacityExceededError ||
+      normalized instanceof CorruptInputError ||
+      normalized instanceof SourceMissingError ||
+      normalized instanceof DuplicateActiveFileVersionError
+    ) {
+      jobStatus = JOB_STATUS.FAILED;
+      clearQueuedFileVersionIndex = true;
+      await updateFailedState(job, normalized, context, JOB_STATUS.FAILED);
+      await notifyCallback(job, {
+        status: normalized instanceof CorruptInputError ? "corrupt" : "failed",
+        errorCode: normalized.code,
+        errorMessage: normalized.publicMessage,
+      });
+      throw new UnrecoverableError(normalized.publicMessage);
+    }
+
+    const transientError =
+      normalized instanceof Error
+        ? normalized
+        : new TransientProcessingError("Processing failed");
+    const shouldRetry = (bullJob?.attemptsMade ?? 0) < maxAttempts(bullJob) - 1;
+    jobStatus = shouldRetry ? JOB_STATUS.RETRYING : JOB_STATUS.FAILED;
+    clearQueuedFileVersionIndex = !shouldRetry;
+
+    await updateFailedState(job, transientError, context, jobStatus);
+
+    if (!shouldRetry) {
+      await notifyCallback(job, {
+        status: "failed",
         errorCode: "processing_failed",
-        errorMessage: toPublicErrorMessage(err?.message),
+        errorMessage: toPublicErrorMessage(transientError.message),
       });
     }
 
-    /** Requeue logic or Dead Letter Queue (DLQ) */
-    if (!isRetrying) {
-      const shouldRequeue = job.size < 500 * 1024 * 1024;
-
-      const totalRetries = job.retryCount || 0;
-
-      /**
-       * Detect poison jobs (same failure repeating)
-       */
-      const lastError = err.message || 'unknown';
-
-      const prevError = await connection.hget(REDIS_KEYS.JOB(job.fileId), 'lastError');
-
-      const normalize = (e: string) => e.split('\n')[0]; // first line only
-      const isSameError = normalize(prevError || '') === normalize(lastError);
-
-      /**
-       * If same error repeats, stop retrying early
-       */
-      if (isSameError && totalRetries >= 2) {
-        logger.warn('Poison job detected', { jobId: job.fileId });
-
-        await connection.rpush(
-          REDIS_KEYS.DLQ,
-          JSON.stringify({ ...job, error: lastError })
-        );
-
-        return;
-      }
-
-      /**
-       * Store last error for comparison
-       */
-      await connection.hset(REDIS_KEYS.JOB(job.fileId), 'lastError', lastError);
-
-      if (shouldRequeue && totalRetries < MAX_TOTAL_RETRIES) {
-        logger.info('Requeueing job', { jobId: job.fileId, attempt: totalRetries + 1 });
-
-        await enqueueFile({
-          ...job,
-          retryCount: totalRetries + 1,
-        });
-      } else {
-        logger.info('Moving job to DLQ', { jobId: job.fileId });
-        await connection.rpush(REDIS_KEYS.DLQ, JSON.stringify(job));
-      }
-    }
-
-    // Bubble up the error for BullMQ to handle retry/backoff
-    throw err;
-
+    throw transientError;
   } finally {
-    await releaseLocalCpuSlot();
+    if (heartbeat) clearInterval(heartbeat);
 
-    /**
-     * Release user slot
-     */
-    if (userSlotAcquired) {
+    if (userSlotHeld) {
       try {
-        await releaseUserSlot(userId);
-      } catch {
-        // swallow — cleanup must never crash worker
+        await releaseUserSlot(userId, job.fileId);
+      } catch (error) {
+        logger.error("Failed to release user slot", {
+          jobId: job.fileId,
+          error,
+        });
       }
     }
 
-    /**
-     * Release EXACT reserved disk.
-     * Prevents drift between reserve/release values.
-     */
-    if (diskReserved && reservedDisk > 0) {
+    if (diskReserved) {
       try {
-        await releaseDisk(reservedDisk);
-      } catch {
-        // swallow — cleanup must never crash worker
+        await releaseDisk(job.fileId);
+      } catch (error) {
+        logger.error("Failed to release disk reservation", {
+          jobId: job.fileId,
+          error,
+        });
       }
     }
 
-    /**
-     * Cleanup strategy:
-     * - Always clean on success
-     * - Keep failed temp for retry BUT limit retention
-     */
+    if (clearQueuedFileVersionIndex && job.fileVersionId) {
+      try {
+        const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(job.fileVersionId);
+        const owner = await connection.get(queuedKey);
+        if (owner === job.fileId) {
+          await connection.del(queuedKey);
+        }
+      } catch (error) {
+        logger.error("Failed to release fileVersion queued slot", {
+          jobId: job.fileId,
+          fileVersionId: job.fileVersionId,
+          error,
+        });
+      }
+    }
+
+    if (fileVersionSlotHeld && job.fileVersionId) {
+      try {
+        const key = REDIS_KEYS.ACTIVE_FILE_VERSION(job.fileVersionId);
+        const owner = await connection.get(key);
+        if (owner === job.fileId) {
+          await connection.del(key);
+        }
+      } catch (error) {
+        logger.error("Failed to release fileVersion active slot", {
+          jobId: job.fileId,
+          fileVersionId: job.fileVersionId,
+          error,
+        });
+      }
+    }
+
     if (jobStatus === JOB_STATUS.COMPLETED) {
-      await fs.promises.rm(tempDir, { recursive: true, force: true });
-    } else {
-      /**
-       * Schedule delayed cleanup for failed jobs to allow for retries and debugging.
-       * Prevent disk explosion
-       */
-      setTimeout(async () => {
+      try {
+        await fs.promises.rm(tempDir, { recursive: true, force: true });
+        await connection.hdel(jobKey, "tempDir", "tempCleanupEligibleAt");
+      } catch (error) {
+        logger.error("Completed temp cleanup failed", {
+          jobId: job.fileId,
+          error,
+        });
         try {
-            await fs.promises.rm(tempDir, { recursive: true, force: true });
-          } catch (cleanupErr) { 
-            logger.error('Cleanup deletion failed', { jobId: job.fileId, error: cleanupErr });
-          }
-      }, 1000 * 60 * 30); // 30 minutes retention
+          await connection.hset(jobKey, {
+            tempDir,
+            tempCleanupEligibleAt: Date.now(),
+          });
+        } catch (metadataError) {
+          logger.error("Completed temp cleanup metadata update failed", {
+            jobId: job.fileId,
+            error: metadataError,
+          });
+        }
+      }
+    } else if (tempRemovedForResourceWait) {
+      try {
+        await connection.hdel(jobKey, "tempDir", "tempCleanupEligibleAt");
+      } catch (error) {
+        logger.error("Temp cleanup metadata clear failed after resource wait", {
+          jobId: job.fileId,
+          error,
+        });
+      }
+    } else {
+      try {
+        await connection.hset(jobKey, {
+          tempDir,
+          tempCleanupEligibleAt:
+            Date.now() + config.cleanup.failedTempRetentionMs,
+        });
+      } catch (error) {
+        logger.error("Temp cleanup metadata update failed", {
+          jobId: job.fileId,
+          error,
+        });
+      }
     }
 
-    // Release lock
     try {
       const owner = await connection.get(lockKey);
       if (owner === WORKER_ID) {
         await connection.del(lockKey);
       }
-    } catch (err) {
-      logger.error('Lock release error', { jobId: job.fileId, error: err });
-    }
-    if (heartbeat) {
-      clearInterval(heartbeat);
+    } catch (error) { 
+      logger.error("Lock release error", { jobId: job.fileId, error });
     }
   }
 }

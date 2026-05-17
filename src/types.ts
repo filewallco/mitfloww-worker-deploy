@@ -84,4 +84,5 @@ export type JobStatus =
   | "uploading"
   | "completed"
   | "retrying"
-  | "failed";
+  | "failed"
+  | "cancelled";

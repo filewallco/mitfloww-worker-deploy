@@ -2,6 +2,29 @@ export function toPublicErrorMessage(message?: string | null): string {
   const normalized = (message || '').toLowerCase();
 
   if (
+    normalized.includes('capacity_exceeded') ||
+    normalized.includes('file_too_large') ||
+    normalized.includes('too large for the current worker capacity')
+  ) {
+    return 'File is too large for the current worker capacity';
+  }
+
+  if (
+    normalized.includes('source_missing') ||
+    normalized.includes('source object not found') ||
+    normalized.includes('source file was not found')
+  ) {
+    return 'Source file was not found';
+  }
+
+  if (
+    normalized.includes('resource_wait_timeout') ||
+    normalized.includes('worker capacity is unavailable')
+  ) {
+    return 'Worker capacity is unavailable right now. Please retry later.';
+  }
+
+  if (
     normalized === 'invalid or unsupported media file' ||
     normalized === 'file exceeds allowed limits' ||
     normalized === 'processing timed out' ||

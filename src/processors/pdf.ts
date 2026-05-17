@@ -1,7 +1,17 @@
 import fs from 'fs';
-import path from 'path';
-import { PDFDocument, ParseSpeeds } from 'pdf-lib';
+import {
+  degrees,
+  PDFDocument,
+  ParseSpeeds,
+  rgb,
+  StandardFonts,
+} from 'pdf-lib';
 import { config } from '../config';
+import {
+  createRepeatedWatermarkOverlay,
+  getDefaultWatermarkText,
+  isLogoWatermarkEnabled,
+} from '../utils/watermark';
 
 type PdfOutput = {
   ext: string;
@@ -39,7 +49,30 @@ function assertPageSize(width: number, height: number) {
   }
 }
 
-async function applyPdfWatermark(input: string, outputPath: string): Promise<void> {
+function fitTextFontSize(input: {
+  text: string;
+  pageWidth: number;
+  pageHeight: number;
+}) {
+  const shorterSide = Math.min(input.pageWidth, input.pageHeight);
+  const longerSide = Math.max(input.pageWidth, input.pageHeight);
+
+  const target = longerSide * 0.78;
+  const estimatedCharWidth = Math.max(1, input.text.length * 0.58);
+
+  return Math.max(
+    36,
+    Math.min(shorterSide * 0.16, target / estimatedCharWidth),
+  );
+}
+
+async function applyPdfWatermark(
+  input: string,
+  outputPath: string,
+  options?: {
+    watermarkText?: string;
+  },
+): Promise<void> {
   const stat = await fs.promises.stat(input);
 
   if (!stat.isFile() || stat.size > config.security.maxPdfBytes) {
@@ -47,11 +80,7 @@ async function applyPdfWatermark(input: string, outputPath: string): Promise<voi
   }
 
   const deadline = Date.now() + config.security.pdfProcessingTimeoutMs;
-  const watermarkPath = path.resolve(__dirname, '../../assets/watermark.png');
-  const [pdfBytes, watermarkBytes] = await Promise.all([
-    fs.promises.readFile(input),
-    fs.promises.readFile(watermarkPath),
-  ]);
+  const pdfBytes = await fs.promises.readFile(input);
 
   assertDeadline(deadline);
 
@@ -79,7 +108,12 @@ async function applyPdfWatermark(input: string, outputPath: string): Promise<voi
     throw new Error('PDF page count exceeds safety limit');
   }
 
-  const watermark = await pdfDoc.embedPng(watermarkBytes);
+  const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const text = options?.watermarkText || getDefaultWatermarkText();
+  const opacity = Math.max(
+    0.06,
+    Math.min(Number(process.env.PDF_WATERMARK_OPACITY || 0.14), 0.25),
+  );
 
   for (const page of pages) {
     assertDeadline(deadline);
@@ -87,17 +121,46 @@ async function applyPdfWatermark(input: string, outputPath: string): Promise<voi
     const { width: pageWidth, height: pageHeight } = page.getSize();
     assertPageSize(pageWidth, pageHeight);
 
-    const margin = Math.max(18, Math.min(pageWidth, pageHeight) * 0.035);
-    const maxWatermarkWidth = Math.min(180, pageWidth * 0.22);
-    const maxWatermarkHeight = pageHeight * 0.14;
-    const watermarkSize = watermark.scaleToFit(maxWatermarkWidth, maxWatermarkHeight);
+        if (isLogoWatermarkEnabled()) {
+      const overlay = await createRepeatedWatermarkOverlay({
+        width: Math.round(pageWidth),
+        height: Math.round(pageHeight),
+        text,
+        opacity,
+        density: 'light',
+      });
 
-    page.drawImage(watermark, {
-      x: pageWidth - watermarkSize.width - margin,
-      y: margin,
-      width: watermarkSize.width,
-      height: watermarkSize.height,
-      opacity: 0.35,
+      const overlayImage = await pdfDoc.embedPng(overlay);
+
+      page.drawImage(overlayImage, {
+        x: 0,
+        y: 0,
+        width: pageWidth,
+        height: pageHeight,
+      });
+
+      await new Promise((resolve) => setImmediate(resolve));
+      continue;
+    }
+
+    const fontSize = fitTextFontSize({
+      text,
+      pageWidth,
+      pageHeight,
+    });
+
+    const textWidth = font.widthOfTextAtSize(text, fontSize);
+    const x = pageWidth / 2 - textWidth / 2;
+    const y = pageHeight / 2;
+
+    page.drawText(text, {
+      x,
+      y,
+      size: fontSize,
+      font,
+      color: rgb(0.15, 0.15, 0.15),
+      opacity,
+      rotate: degrees(-32),
     });
 
     await new Promise((resolve) => setImmediate(resolve));
@@ -116,13 +179,19 @@ async function applyPdfWatermark(input: string, outputPath: string): Promise<voi
   await fs.promises.writeFile(outputPath, outputBytes);
 }
 
-export async function processPdf(input: string, outputBase: string): Promise<PdfOutput> {
+export async function processPdf(
+  input: string,
+  outputBase: string,
+  options?: {
+    watermarkText?: string;
+  },
+): Promise<PdfOutput> {
   const ext = '.pdf';
   const outputPath = `${outputBase}${ext}`;
 
   await withTimeout(
-    applyPdfWatermark(input, outputPath),
-    config.security.pdfProcessingTimeoutMs
+    applyPdfWatermark(input, outputPath, options),
+    config.security.pdfProcessingTimeoutMs,
   );
 
   return { ext, outputPath };

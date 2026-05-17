@@ -1,5 +1,5 @@
 import { smallQueue, mediumQueue, largeQueue, imageQueue } from './queues';
-import { ATTEMPTS, FileJob } from '../types';
+import { FileJob } from '../types';
 import { connection } from './connection';
 import { logger } from '../utils/logger';
 import { config } from '../config';
@@ -8,6 +8,31 @@ import { FILE_TYPE, JOB_STAGE, JOB_STATUS, QUEUE_NAME, REDIS_KEYS } from "../con
 import { classify, getPriority } from "./priority";
 
 const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const JOB_META_TTL_SECONDS = 60 * 60 * 24;
+const JOB_META_TTL_MS = JOB_META_TTL_SECONDS * 1000;
+
+async function reserveQueuedFileVersion(fileVersionId: string, jobId: string): Promise<void> {
+  const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(fileVersionId);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const reserved = await connection.set(queuedKey, jobId, 'PX', JOB_META_TTL_MS, 'NX');
+    if (reserved === 'OK') {
+      return;
+    }
+
+    const owner = await connection.get(queuedKey);
+    if (owner === jobId) {
+      await connection.pexpire(queuedKey, JOB_META_TTL_MS);
+      return;
+    }
+
+    if (owner) {
+      throw new Error('duplicate_queued_file_version');
+    }
+  }
+
+  throw new Error('queued_file_version_reservation_failed');
+}
 
 /**
  * Enqueues a file processing job:
@@ -48,9 +73,7 @@ export async function enqueueFile(job: FileJob) {
    * hgettall(redis) - Gets all fields of a hash (object)
    */
   const existing = await connection.hgetall(REDIS_KEYS.JOB(job.fileId));
-  const retryCount = existing.retryCount
-    ? Number(existing.retryCount) + 1
-    : 0;
+  const retryCount = existing.retryCount ? Number(existing.retryCount) + 1 : 0;
 
   const inputRef =
     job.inputUrl ??
@@ -66,6 +89,15 @@ export async function enqueueFile(job: FileJob) {
         : sizeType === "medium"
           ? QUEUE_NAME.MEDIUM
           : QUEUE_NAME.LARGE;
+
+  if (job.fileVersionId) {
+    const activeOwner = await connection.get(REDIS_KEYS.ACTIVE_FILE_VERSION(job.fileVersionId));
+    if (activeOwner && activeOwner !== job.fileId) {
+      throw new Error('duplicate_active_file_version');
+    }
+
+    await reserveQueuedFileVersion(job.fileVersionId, job.fileId);
+  }
 
   /**
    * Store initial metadata in Redis.
@@ -94,6 +126,17 @@ export async function enqueueFile(job: FileJob) {
       userTier: job.userTier,
       progress: 0,
       retryCount,
+      maxAttempts: config.processing.maxAttempts,
+      attemptsMade: 0,
+      resourceWaitCount:
+        existing.resourceWaitCount && Number(existing.resourceWaitCount) > 0
+          ? Number(existing.resourceWaitCount)
+          : "",
+
+      firstResourceWaitAt:
+        existing.firstResourceWaitAt && Number(existing.firstResourceWaitAt) > 0
+          ? Number(existing.firstResourceWaitAt)
+          : "",
       userId: job.userId,
       batchId: job.batchId || "",
       callbackUrl: job.callbackUrl ?? "",
@@ -108,29 +151,40 @@ export async function enqueueFile(job: FileJob) {
    * Set a TTL of 24 hours for job metadata
    * Auto deletes key after time
    * Prevent Redis memory leak
-   */ 
-  await connection.expire(REDIS_KEYS.JOB(job.fileId), 60 * 60 * 24);
-  
+   */
+  await connection.expire(REDIS_KEYS.JOB(job.fileId), JOB_META_TTL_SECONDS);
+
   const queue =
-  queueName === QUEUE_NAME.IMAGE
-    ? imageQueue
-    : queueName === QUEUE_NAME.SMALL
-      ? smallQueue
-      : queueName === QUEUE_NAME.MEDIUM
-        ? mediumQueue
-        : largeQueue;
+    queueName === QUEUE_NAME.IMAGE
+      ? imageQueue
+      : queueName === QUEUE_NAME.SMALL
+        ? smallQueue
+        : queueName === QUEUE_NAME.MEDIUM
+          ? mediumQueue
+          : largeQueue;
 
   /**
    * Add job to the appropriate queue
    */
-  return queue.add(sizeType, job, {
-    jobId: job.fileId,
-    priority: await getPriority(job),
-    attempts: ATTEMPTS[sizeType],
-    backoff: {
-      type: 'exponential',
-      delay: 5000,
-    },
-    removeOnComplete: false,
-  });
+  try {
+    return queue.add(sizeType, job, {
+      jobId: job.fileId,
+      priority: await getPriority(job),
+      attempts: config.processing.maxAttempts,
+      backoff: {
+        type: 'exponential',
+        delay: 5000,
+      },
+      removeOnComplete: false,
+    });
+  } catch (error) {
+    if (job.fileVersionId) {
+      const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(job.fileVersionId);
+      const owner = await connection.get(queuedKey);
+      if (owner === job.fileId) {
+        await connection.del(queuedKey);
+      }
+    }
+    throw error;
+  }
 }

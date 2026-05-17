@@ -3,6 +3,20 @@ import { connection } from '../queue/connection';
 import { enqueueFile } from '../queue/enqueue';
 import { imageQueue } from '../queue/queues';
 import { FILE_TYPE, JOB_STAGE, JOB_STATUS, QUEUE_NAME, REDIS_KEYS } from "../constants";
+import { config } from '../config';
+import { logger } from '../utils/logger';
+import { getJobReservation, reconcileResourceHolders, releaseDisk } from '../worker/resourceManager';
+
+async function getBullState(jobId: string): Promise<string | null> {
+  const jobInstance =
+    (await imageQueue.getJob(jobId)) ||
+    (await smallQueue.getJob(jobId)) ||
+    (await mediumQueue.getJob(jobId)) ||
+    (await largeQueue.getJob(jobId));
+
+  if (!jobInstance) return null;
+  return await jobInstance.getState();
+}
 /**
  * Returns structured system snapshot.
  * Separates LIVE jobs and HISTORY jobs.
@@ -59,6 +73,7 @@ export async function getSystemSnapshot() {
   const smallCount = await smallQueue.getWaitingCount();
   const mediumCount = await mediumQueue.getWaitingCount();
   const largeCount = await largeQueue.getWaitingCount();
+  const imageCount = await imageQueue.getWaitingCount();
 
   /**
    * Iterate with index to compute queue position
@@ -129,6 +144,7 @@ export async function getSystemSnapshot() {
     let queueSize = 0;
     if (job.queueName === QUEUE_NAME.SMALL) queueSize = smallCount;
     else if (job.queueName === QUEUE_NAME.MEDIUM) queueSize = mediumCount;
+    else if (job.queueName === QUEUE_NAME.IMAGE) queueSize = imageCount;
     else queueSize = largeCount;
 
     const avgProcessingTime = 30000; // start with 30s baseline
@@ -180,7 +196,15 @@ export async function getSystemSnapshot() {
     } else {
       live.push(formatted);
 
-      if (formatted.stage === JOB_STAGE.WAITING) stats.waiting++;
+      if (
+        formatted.stage === JOB_STAGE.WAITING ||
+        formatted.stage === JOB_STAGE.WAITING_FOR_DISK ||
+        formatted.stage === JOB_STAGE.WAITING_FOR_CPU ||
+        formatted.stage === JOB_STAGE.WAITING_FOR_USER_SLOT ||
+        formatted.stage === JOB_STAGE.DELAYED
+      ) {
+        stats.waiting++;
+      }
       if (formatted.stage === JOB_STAGE.PROCESSING) stats.processing++;
       if (formatted.stage === JOB_STAGE.UPLOADING) stats.uploading++;
     }
@@ -224,19 +248,31 @@ async function scanKeys(pattern: string): Promise<string[]> {
  * - no update for > X time
  */
 export async function recoverStuckJobs() {
+  await reconcileResourceHolders().catch((error) => {
+    logger.error('reconcileResourceHolders failed', { error });
+  });
+
   const keys = (await scanKeys("job:*")).filter(
     (key) => !key.includes(":logs"),
   );
 
   const now = Date.now();
-
-  /**
-   * 5 minutes is too aggressive for large video processing.
-   * FFmpeg may not emit progress frequently enough under CPU pressure.
-   */
   const STUCK_THRESHOLD = Number(
     process.env.STUCK_JOB_THRESHOLD_MS || 30 * 60 * 1000,
   );
+  const RECOVERABLE_STAGES = new Set<string>([
+    JOB_STAGE.PROCESSING,
+    JOB_STAGE.UPLOADING,
+    JOB_STAGE.DOWNLOADING,
+    JOB_STAGE.VALIDATING,
+    JOB_STAGE.RESERVED,
+    JOB_STAGE.WAITING_FOR_DISK,
+    JOB_STAGE.WAITING_FOR_CPU,
+    JOB_STAGE.WAITING_FOR_USER_SLOT,
+    JOB_STAGE.DELAYED,
+    JOB_STAGE.STARTING,
+    JOB_STAGE.STUCK_RECOVERY,
+  ]);
 
   for (const key of keys) {
     const jobId = key.replace("job:", "");
@@ -252,32 +288,26 @@ export async function recoverStuckJobs() {
 
       const state = jobInstance ? await jobInstance.getState() : null;
       const lockOwner = await connection.get(REDIS_KEYS.LOCK(jobId));
+      const heartbeatAt = Number(meta.heartbeatAt || meta.updatedAt || 0);
+      const heartbeatFresh = heartbeatAt > 0 && now - heartbeatAt < STUCK_THRESHOLD;
+      const reservationBytes = await getJobReservation(jobId);
+      const hasReservation = reservationBytes > 0;
 
-      /**
-       * CRITICAL:
-       * Never remove or requeue an active BullMQ job.
-       * BullMQ owns the lock and will throw:
-       * "could not be removed because it is locked by another worker"
-       */
+      // Never recover live Bull active jobs.
       if (state === "active") {
-        await connection.hset(key, {
-          status: JOB_STATUS.PROCESSING,
-          updatedAt: now,
-        });
         continue;
       }
 
-      /**
-       * If the Mitfloww idempotency lock still exists, assume a worker is alive
-       * or recently died. Let the lock expire naturally before recovery.
-       */
-      if (lockOwner) {
+      // Never recover if lock + heartbeat are still fresh.
+      if (lockOwner && heartbeatFresh) {
         continue;
       }
 
-      /**
-       * These states are not orphaned. Do not touch them.
-       */
+      // Never recover if reservation + heartbeat are still fresh.
+      if (hasReservation && heartbeatFresh) {
+        continue;
+      }
+
       if (
         state === "waiting" ||
         state === "delayed" ||
@@ -288,39 +318,72 @@ export async function recoverStuckJobs() {
         continue;
       }
 
-      if (
-        meta.status !== JOB_STATUS.PROCESSING &&
-        meta.status !== JOB_STATUS.RETRYING
-      ) {
+      if (meta.status !== JOB_STATUS.PROCESSING && meta.status !== JOB_STATUS.RETRYING) {
         continue;
       }
 
-      const updatedAt = Number(meta.updatedAt || 0);
-
-      if (updatedAt && now - updatedAt < STUCK_THRESHOLD) {
+      if (meta.stage && !RECOVERABLE_STAGES.has(meta.stage)) {
         continue;
       }
 
-      console.log(`Recovering orphaned stuck job: ${jobId}`);
+      if (heartbeatFresh) {
+        continue;
+      }
+
+      const manualRetryCount = Number(meta.manualRetryCount || 0);
+      if (manualRetryCount >= config.processing.maxManualRetries) {
+        await connection.hset(key, {
+          status: JOB_STATUS.FAILED,
+          stage: JOB_STAGE.FAILED,
+          error: 'Stuck recovery retries exhausted',
+          errorCode: 'stuck_recovery_exhausted',
+          updatedAt: now,
+        });
+
+        if (meta.fileVersionId) {
+          const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(meta.fileVersionId);
+          const activeKey = REDIS_KEYS.ACTIVE_FILE_VERSION(meta.fileVersionId);
+          const [queuedOwner, activeOwner] = await Promise.all([
+            connection.get(queuedKey),
+            connection.get(activeKey),
+          ]);
+          if (queuedOwner === jobId) {
+            await connection.del(queuedKey);
+          }
+          if (activeOwner === jobId) {
+            await connection.del(activeKey);
+          }
+        }
+        continue;
+      }
+
+      if (meta.fileVersionId) {
+        const activeOwner = await connection.get(REDIS_KEYS.ACTIVE_FILE_VERSION(meta.fileVersionId));
+        if (activeOwner && activeOwner !== jobId) {
+          continue;
+        }
+      }
+
+      if (meta.inputUrl?.startsWith('file://') && process.env.ALLOW_LOCAL_FILE_INPUTS !== 'true') {
+        continue;
+      }
+
+      if (!lockOwner && hasReservation) {
+        await releaseDisk(jobId);
+      }
 
       await connection.hset(key, {
         status: JOB_STATUS.RETRYING,
         stage: JOB_STAGE.STUCK_RECOVERY,
         recoveredAt: now,
+        manualRetryCount: manualRetryCount + 1,
         updatedAt: now,
       });
 
-      /**
-       * Only remove non-active jobs.
-       */
       if (jobInstance) {
         try {
           await jobInstance.remove();
-        } catch (removeError: any) {
-          console.warn(
-            `Skipping recovery for locked/non-removable job: ${jobId}`,
-            removeError?.message || removeError,
-          );
+        } catch {
           continue;
         }
       }
@@ -358,8 +421,12 @@ export async function recoverStuckJobs() {
         Boolean(meta.inputUrl) &&
         !meta.inputUrl.startsWith("file://") &&
         process.env.ALLOW_REMOTE_INPUT_URLS === "true";
+      const hasAllowedLocalUrl =
+        Boolean(meta.inputUrl) &&
+        meta.inputUrl.startsWith("file://") &&
+        process.env.ALLOW_LOCAL_FILE_INPUTS === "true";
 
-      if (!hasR2Source && !hasAllowedRemoteUrl) {
+      if (!hasR2Source && !hasAllowedRemoteUrl && !hasAllowedLocalUrl) {
         console.warn(`Skipping stuck job recovery without R2 source: ${jobId}`);
         continue;
       }
@@ -367,7 +434,7 @@ export async function recoverStuckJobs() {
       await enqueueFile({
         fileId: jobId,
 
-        inputUrl: hasAllowedRemoteUrl ? meta.inputUrl : undefined,
+        inputUrl: hasAllowedRemoteUrl || hasAllowedLocalUrl ? meta.inputUrl : undefined,
         sourceBucket: meta.sourceBucket || undefined,
         sourceKey: meta.sourceKey || undefined,
         outputBucket: meta.outputBucket || undefined,
@@ -391,7 +458,7 @@ export async function recoverStuckJobs() {
           process.env.PROCESSING_CALLBACK_TOKEN || meta.callbackToken || "",
       });
     } catch (error) {
-      console.error(`recoverStuckJobs failed for ${jobId}`, error);
+      logger.error(`recoverStuckJobs failed for ${jobId}`, { error });
     }
   }
 }

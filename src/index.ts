@@ -13,6 +13,7 @@ import './worker/standardWorker';
 import './worker/heavyWorker';
 import './worker/imageWorker';
 import { startPriorityScheduler } from './scheduler/priorityScheduler';
+import { reconcileResourceHolders } from './worker/resourceManager';
 
 process.env.SESSION_ID = Date.now().toString();
 
@@ -42,6 +43,9 @@ startWS();
 startPriorityScheduler();
 
 setInterval(() => {
+  reconcileResourceHolders().catch((err) =>
+    logger.error('reconcileResourceHolders failed', { error: err }),
+  );
   recoverStuckJobs().catch((err) => logger.error('recoverStuckJobs failed', { error: err }));
 }, 60000); // every 1 min
 

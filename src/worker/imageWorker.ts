@@ -5,9 +5,9 @@ import { config } from '../config';
 
 new Worker(
   'image-files',
-  async (job) => {
+  async (job, token) => {
     console.log('IMAGE worker:', job.id);
-    await handleJob(job.data, job);
+    await handleJob(job.data, job, token);
   },
   {
     connection,

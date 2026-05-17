@@ -9,7 +9,7 @@ import { connection } from "./connection";
  */
 export function classify(size: number): 'small' | 'medium' | 'large' {
   if (size < 100 * MB) return 'small';
-  if (size < 500 * MB) return 'medium';
+  if (size < 800 * MB) return 'medium';
   return 'large';
 }
 

@@ -8,9 +8,9 @@ import { config } from '../config';
  */
 new Worker(
   'large-files',
-  async (job) => {
+  async (job, token) => {
     console.log('HEAVY worker:', job.id);
-    await handleJob(job.data, job);
+    await handleJob(job.data, job, token);
   },
   {
     connection,

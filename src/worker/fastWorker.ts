@@ -10,9 +10,9 @@ import os from 'os';
  */
 new Worker(
   'small-files',
-  async (job) => {
+  async (job, token) => {
     console.log('FAST worker:', job.id);
-    await handleJob(job.data, job);
+    await handleJob(job.data, job, token);
   },
   {
     connection,

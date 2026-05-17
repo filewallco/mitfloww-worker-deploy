@@ -1,6 +1,7 @@
 import { WebSocketServer } from 'ws';
 import { getSystemSnapshot } from './admin';
 import { isWebSocketRequestAuthorized } from '../security/auth';
+import { config } from '../config';
 
 /**
  * WebSocket server for real-time updates
@@ -21,7 +22,7 @@ export function startWS() {
         client.send(data);
       }
     });
-  }, 1000);
+  }, config.wsSnapshotIntervalMs);
 
   console.log('WebSocket running on ws://localhost:4001');
 }

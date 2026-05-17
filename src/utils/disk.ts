@@ -1,12 +1,26 @@
 import fs from 'fs';
 import { config } from '../config';
 
-/**
- * Returns available disk space (bytes) for temp directory.
- * Uses statfs (Node 18+).
- */
-export function getFreeDiskSpace(): number {
-  const stat = (fs as any).statfsSync(config.tempDir);
+type DiskStats = {
+  freeBytes: number;
+  totalBytes: number;
+};
 
-  return stat.bavail * stat.bsize; // available blocks * block size
+function statFsSafe(): any {
+  return (fs as any).statfsSync(config.tempDir);
+}
+
+export function getDiskStats(): DiskStats {
+  const stat = statFsSafe();
+  const freeBytes = Number(stat.bavail) * Number(stat.bsize);
+  const totalBytes = Number(stat.blocks) * Number(stat.bsize);
+  return { freeBytes, totalBytes };
+}
+
+export function getFreeDiskSpace(): number {
+  return getDiskStats().freeBytes;
+}
+
+export function getDiskCapacity(): number {
+  return getDiskStats().totalBytes;
 }

@@ -1,6 +1,9 @@
 import sharp from 'sharp';
-import path from 'path';
 import { config } from '../config';
+import {
+  createRepeatedWatermarkOverlay,
+  getDefaultWatermarkText,
+} from '../utils/watermark';
 
 type ImageOutputPlan = {
   ext: string;
@@ -60,53 +63,73 @@ function buildImageOutputPlan(metadata: sharp.Metadata): ImageOutputPlan {
     ext: '.jpg',
     apply: (pipeline) =>
       pipeline.jpeg({
-        quality: 82,
+        quality: 84,
         mozjpeg: true,
       }),
   };
 }
 
-export async function processImage(
-  input: string,
-  outputBase: string
-): Promise<{ ext: string; outputPath: string }> {
-  const watermarkPath = path.resolve(
-    __dirname,
-    '../../assets/watermark.png'
+function getResizedDimensions(metadata: sharp.Metadata) {
+  const originalWidth = metadata.width || 1024;
+  const originalHeight = metadata.height || 1024;
+
+  const targetWidth = Math.min(originalWidth, 1600);
+  const targetHeight = Math.max(
+    1,
+    Math.round((originalHeight * targetWidth) / originalWidth),
   );
 
+  return { targetWidth, targetHeight };
+}
+
+export async function processImage(
+  input: string,
+  outputBase: string,
+  options?: {
+    watermarkText?: string;
+  },
+): Promise<{ ext: string; outputPath: string }> {
   const probe = sharp(input, {
     animated: true,
     limitInputPixels: config.security.maxImagePixels,
   });
+
   const metadata = await probe.metadata();
-  const totalPixels = (metadata.width || 0) * (metadata.height || 0) * (metadata.pages || 1);
+  const totalPixels =
+    (metadata.width || 0) *
+    (metadata.height || 0) *
+    (metadata.pages || 1);
 
   if (totalPixels > config.security.maxImagePixels) {
     throw new Error('Image exceeds pixel limit');
   }
 
+  const { targetWidth, targetHeight } = getResizedDimensions(metadata);
+
   const image = sharp(input, {
     animated: (metadata.pages || 1) > 1,
     limitInputPixels: config.security.maxImagePixels,
-  }).rotate();
+  })
+    .rotate()
+    .resize({
+      width: targetWidth,
+      withoutEnlargement: true,
+    });
 
-  const targetWidth = Math.min(metadata.width || 1024, 1024);
-  const resized = image.resize({
+  const overlay = await createRepeatedWatermarkOverlay({
     width: targetWidth,
-    withoutEnlargement: true,
+    height: targetHeight,
+    text: options?.watermarkText || getDefaultWatermarkText(),
+    opacity: Number(process.env.IMAGE_WATERMARK_OPACITY || 0.16),
+    density: 'normal',
   });
 
-  const wmWidth = Math.max(48, Math.floor(targetWidth * 0.1));
-  const watermark = await sharp(watermarkPath)
-    .resize(wmWidth)
-    .png()
-    .toBuffer();
-
-  const pipeline = resized.composite([
+  const pipeline = image.composite([
     {
-      input: watermark,
-      gravity: 'southeast',
+      input: overlay,
+      left: 0,
+      top: 0,
+      blend: 'over',
     },
   ]);
 

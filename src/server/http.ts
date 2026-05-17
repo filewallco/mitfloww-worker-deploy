@@ -2,15 +2,15 @@ import http from 'http';
 import { getSystemSnapshot } from './admin';
 import { getJobDetail } from './jobDetail';
 import { getDLQ } from './dlq';
+import { getPublicJobStatus, getPublicJobStatuses } from './jobStatus';
 import { enqueueFile } from '../queue/enqueue';
 import { connection } from '../queue/connection';
 import fs from 'fs';
 import path from 'path';
-import { FILE_TYPE, JOB_STATUS, REDIS_KEYS } from '../constants';
+import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
 import { imageQueue, largeQueue, mediumQueue, smallQueue } from '../queue/queues';
 import { config } from '../config';
 import { isAdminRequestAuthorized } from '../security/auth';
-import { toPublicErrorMessage } from '../security/errors';
 
 const STATIC_ROOT = path.resolve(process.cwd(), 'outputs');
 const STATIC_CONTENT_TYPES: Record<string, string> = {
@@ -33,6 +33,7 @@ const STATIC_HEADERS = {
   'Accept-Ranges': 'bytes',
   'X-Content-Type-Options': 'nosniff',
 };
+const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 function readJson(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -241,6 +242,47 @@ export function startAdminServer() {
         'Access-Control-Allow-Headers': 'Range, Authorization',
       });
       return res.end();
+    }
+
+    if (req.url === "/jobs/status" && req.method === "POST") {
+      if (!isWorkerRequestAuthorized(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      try {
+        const body = await readJson(req);
+        const jobIds = Array.isArray(body?.jobIds) ? body.jobIds : null;
+
+        if (!jobIds) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "jobIds array is required" }));
+          return;
+        }
+
+        if (jobIds.length === 0 || jobIds.length > 50) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "jobIds must contain between 1 and 50 ids" }));
+          return;
+        }
+
+        const invalid = jobIds.find((jobId: unknown) => typeof jobId !== 'string' || !SAFE_JOB_ID.test(jobId));
+        if (invalid) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "jobIds contain invalid id values" }));
+          return;
+        }
+
+        const statuses = await getPublicJobStatuses(jobIds as string[]);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(statuses));
+        return;
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid request" }));
+        return;
+      }
     }
 
     if (req.url === "/jobs" && req.method === "POST") {
@@ -506,83 +548,10 @@ export function startAdminServer() {
      * Retry endpoint (NEW)
      */
     if (req.url?.startsWith('/admin/retry/')) {
-      const id = req.url.split('/').pop();
-
-      if (!id) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: 'Invalid job id' }));
-        return;
-      }
-
-      const meta = await connection.hgetall(`job:${id}`);
-
-      /**
-       * Validate and narrow Redis string values into proper types
-       */
-      const fileType =
-        meta.fileType === FILE_TYPE.VIDEO ||
-          meta.fileType === FILE_TYPE.IMAGE ||
-          meta.fileType === FILE_TYPE.PDF ||
-          meta.fileType === FILE_TYPE.ZIP ||
-          meta.fileType === FILE_TYPE.OTHER
-          ? meta.fileType
-          : FILE_TYPE.OTHER;
-
-      const userTier =
-        meta.userTier === 'free' ||
-          meta.userTier === 'premium' ||
-          meta.userTier === 'vip'
-          ? meta.userTier
-          : 'free';
-
-      if ((!meta.inputUrl && (!meta.sourceBucket || !meta.sourceKey)) || !meta.outputKey) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: 'Invalid job metadata for retry' }));
-        return;
-      }
-
-      const size = Number(meta.size);
-
-      if (!size || isNaN(size)) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: 'Invalid file size' }));
-        return;
-      }
-
-      await connection.hset(`job:${id}`, {
-        retriedAt: Date.now(),
-      });
-
-      /**
-       * Retry with validated types
-       */
-      await enqueueFile({
-        fileId: id!,
-        inputUrl: meta.inputUrl || undefined,
-        sourceBucket: meta.sourceBucket || undefined,
-        sourceKey: meta.sourceKey || undefined,
-        outputBucket: meta.outputBucket || undefined,
-        outputKey: meta.outputKey,
-        logKey: meta.logKey || undefined,
-
-        fileVersionId: meta.fileVersionId || undefined,
-        fileName: meta.fileName || undefined,
-        originalName: meta.originalName || undefined,
-        mimeType: meta.mimeType || undefined,
-        extension: meta.extension || undefined,
-
-        fileType,
-        size,
-        userTier,
-        userId: meta.userId || "recovered-user",
-        batchId: meta.batchId || undefined,
-
-        callbackUrl: meta.callbackUrl || undefined,
-        callbackToken: process.env.PROCESSING_CALLBACK_TOKEN || meta.callbackToken || "",
-      });
-
-      res.writeHead(200);
-      res.end(JSON.stringify({ success: true }));
+      res.writeHead(410, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'Use fileVersion retry with a fresh job id',
+      }));
       return;
     }
 
@@ -592,37 +561,33 @@ export function startAdminServer() {
     if (req.url?.startsWith('/job/') && !req.url.startsWith('/job/cancel/')) {
       const id = req.url.split('/').pop();
 
-      if (!id) {
+      if (!id || !SAFE_JOB_ID.test(id)) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: 'Invalid job id' }));
         return;
       }
 
-      const meta = await connection.hgetall(`job:${id}`);
-
-      if (!meta || Object.keys(meta).length === 0) {
+      const status = await getPublicJobStatus(id);
+      if (!status) {
         res.writeHead(404);
         res.end(JSON.stringify({ error: 'Job not found' }));
         return;
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: meta.status,
-        stage: meta.stage,
-        progress: Number(meta.progress || 0),
-        queueName: meta.queueName,
-        createdAt: meta.createdAt,
-        startedAt: meta.startedAt,
-        completedAt: meta.completedAt,
-        error: meta.error ? toPublicErrorMessage(meta.error) : null
-      }));
+      res.end(JSON.stringify(status));
 
       return;
     }
 
     if (req.url?.startsWith('/job/cancel/')) {
       const id = req.url.split('/').pop();
+      if (!id || !SAFE_JOB_ID.test(id)) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid job id' }));
+        return;
+      }
+      const meta = await connection.hgetall(`job:${id}`);
 
       const job =
         await imageQueue.getJob(id!) ||
@@ -635,9 +600,25 @@ export function startAdminServer() {
       }
 
       await connection.hset(`job:${id}`, {
-        status: 'cancelled',
-        stage: 'failed',
+        status: JOB_STATUS.CANCELLED,
+        stage: JOB_STAGE.CANCELLED,
       });
+
+      if (meta.fileVersionId) {
+        const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(meta.fileVersionId);
+        const activeKey = REDIS_KEYS.ACTIVE_FILE_VERSION(meta.fileVersionId);
+        const [queuedOwner, activeOwner] = await Promise.all([
+          connection.get(queuedKey),
+          connection.get(activeKey),
+        ]);
+
+        if (queuedOwner === id) {
+          await connection.del(queuedKey);
+        }
+        if (activeOwner === id) {
+          await connection.del(activeKey);
+        }
+      }
 
       res.writeHead(200);
       res.end(JSON.stringify({ success: true }));

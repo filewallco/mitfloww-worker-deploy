@@ -1,8 +1,12 @@
 import { execFileSync, spawn } from 'child_process';
-import path from 'path';
-import { config } from '../config';
+import fs from 'fs';
 import os from 'os';
+import { config } from '../config';
 import { createFfmpegStderrBuffer, logger } from '../utils/logger';
+import {
+  createRepeatedWatermarkOverlayFile,
+  getDefaultWatermarkText,
+} from '../utils/watermark';
 
 type FfprobeStream = {
   codec_type?: string;
@@ -42,8 +46,9 @@ const ALLOWED_VIDEO_CODECS = new Set([
   'vp9',
   'av1',
   'mpeg4',
-  'mjpeg'
+  'mjpeg',
 ]);
+
 const ALLOWED_AUDIO_CODECS = new Set([
   'aac',
   'mp3',
@@ -51,19 +56,11 @@ const ALLOWED_AUDIO_CODECS = new Set([
   'vorbis',
   'pcm_s16le',
   'ac3',
-  'eac3'
+  'eac3',
 ]);
 
-/**
- * Compute FFmpeg thread allocation.
- * Strategy:
- * - Avoid CPU oversubscription
- * - Scale with global CPU limit
- */
 function getFfmpegThreads(): number {
   const globalLimit = Number(process.env.GLOBAL_CPU_LIMIT || os.cpus().length);
-
-  // Divide CPU across expected parallel jobs
   return Math.max(1, Math.floor(globalLimit / 4));
 }
 
@@ -72,13 +69,19 @@ function clampProgress(value: number): number {
   return Math.max(0, Math.min(value, 100));
 }
 
+function evenDimension(value: number | null | undefined, fallback: number) {
+  const raw = Number.isFinite(value) && value && value > 0 ? Number(value) : fallback;
+  return Math.max(2, Math.floor(raw / 2) * 2);
+}
+
 const FFPROBE_PROTOCOL_ARGS = [
   '-protocol_whitelist',
-  'file,pipe,data'
+  'file,pipe,data',
 ];
+
 const LOCAL_INPUT_ARGS = [
   '-protocol_whitelist',
-  'file,pipe,data'
+  'file,pipe,data',
 ];
 
 function runFfprobe(file: string): FfprobePayload {
@@ -98,7 +101,7 @@ function runFfprobe(file: string): FfprobePayload {
 
 function pickPrimaryStream(
   streams: FfprobeStream[],
-  codecType: 'video' | 'audio'
+  codecType: 'video' | 'audio',
 ): FfprobeStream | undefined {
   const matches = streams.filter((stream) => stream.codec_type === codecType);
 
@@ -139,67 +142,88 @@ export function inspectVideoInput(file: string): VideoProbe {
   };
 }
 
-/**
- * Executes FFmpeg to process a video:
- * - Scales to 360p (maintaining aspect ratio)
- * - Applies watermark overlay
- * - Encodes using H.264 (libx264)
- *
- * Design goals:
- * - Non-blocking (child process)
- * - Observable (progress reporting)
- * - Fault-tolerant (stall + max runtime protection)
- *
- * @param input Absolute path to input video file
- * @param output Absolute path for processed output file
- * @param onProgress Optional callback receiving processed timestamp (ms)
- *
- * @returns Promise<void> resolved on success, rejected on failure
- */
-export function processVideo(
+export async function processVideo(
   input: string,
   output: string,
   options?: {
     start?: number;
     duration?: number;
-    totalDuration?: number; // FULL video duration (important)
-    progressOffset?: number; // where this chunk starts in %
-    progressScale?: number;  // how much % this chunk contributes
-    jobId?: string; // optional job id for better diagnostics
+    totalDuration?: number;
+    progressOffset?: number;
+    progressScale?: number;
+    jobId?: string;
+    width?: number | null;
+    height?: number | null;
+    watermarkText?: string;
   },
-  onProgress?: (progress: number) => void
+  onProgress?: (progress: number) => void,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const watermark = path.resolve(__dirname, '../../assets/watermark.png');
+  const outputWidth = evenDimension(options?.width, 1280);
+  const outputHeight = evenDimension(options?.height, 720);
 
+  const overlayPath = await createRepeatedWatermarkOverlayFile(
+    options?.jobId || 'video',
+    {
+      width: outputWidth,
+      height: outputHeight,
+      text: options?.watermarkText || getDefaultWatermarkText(),
+      opacity: Number(process.env.VIDEO_WATERMARK_OPACITY || 0.14),
+      density: 'light',
+    },
+  );
+
+  return new Promise((resolve, reject) => {
     const args = [
       '-y',
       '-nostdin',
 
-      // FAST SEEK (important for large videos)
       ...(options?.start ? ['-ss', String(options.start)] : []),
 
       ...LOCAL_INPUT_ARGS,
-      '-fflags', '+genpts',
-      '-i', input,
+      '-fflags',
+      '+genpts',
+      '-i',
+      input,
+
       ...LOCAL_INPUT_ARGS,
-      '-i', watermark,
+      '-i',
+      overlayPath,
 
       ...(options?.duration ? ['-t', String(options.duration)] : []),
 
-      '-filter_complex', '[0:v:0]scale=-2:360[video];[video][1:v:0]overlay=10:10[vout]',
-      '-map', '[vout]',
-      '-map', '0:a:0?',
+      /**
+       * Keep original resolution but force even dimensions for libx264.
+       * Overlay is full-canvas and low opacity, so review remains usable.
+       */
+      '-filter_complex',
+      `[0:v:0]scale=${outputWidth}:${outputHeight}[base];[base][1:v:0]overlay=0:0[vout]`,
+
+      '-map',
+      '[vout]',
+      '-map',
+      '0:a:0?',
       '-sn',
       '-dn',
-      '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '28',
-      '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac',
-      '-movflags', '+faststart',
-      '-progress', 'pipe:2',
-      '-threads', String(getFfmpegThreads()),
+
+      '-c:v',
+      'libx264',
+      '-preset',
+      'fast',
+      '-crf',
+      '25',
+      '-pix_fmt',
+      'yuv420p',
+
+      '-c:a',
+      'aac',
+      '-movflags',
+      '+faststart',
+
+      '-progress',
+      'pipe:2',
+      '-threads',
+      String(getFfmpegThreads()),
+
       output,
     ];
 
@@ -213,6 +237,14 @@ export function processVideo(
     function cleanup() {
       clearInterval(stallCheck);
       if (hardTimeout) clearTimeout(hardTimeout);
+
+      fs.promises.rm(overlayPath, { force: true }).catch((error) => {
+        logger.warn('Video watermark overlay cleanup failed', {
+          jobId: options?.jobId,
+          overlayPath,
+          error,
+        });
+      });
     }
 
     function safeReject(err: Error) {
@@ -231,14 +263,12 @@ export function processVideo(
 
     ffmpeg.stderr.on('data', (data) => {
       const str = data.toString();
-      // preserve progress data separately
       progressBuffer += str;
 
       const lines = progressBuffer.split('\n');
       progressBuffer = lines.pop() || '';
 
       for (const line of lines) {
-        // track non-progress stderr lines in rolling buffer
         if (!line.startsWith('out_time_ms=')) {
           stderrBuffer.push(line);
         } else {
@@ -247,14 +277,16 @@ export function processVideo(
           if (onProgress) {
             const value = Number(line.split('=')[1]);
 
-            if (!isNaN(value)) {
+            if (!Number.isNaN(value)) {
               const processedMs = value / 1000;
 
               if (options?.totalDuration) {
                 const durationMs =
                   options.duration ? options.duration * 1000 : options.totalDuration;
+
                 const chunkProgress =
                   durationMs > 0 ? processedMs / durationMs : 0;
+
                 const scaled =
                   (options.progressOffset || 0) +
                   chunkProgress * (options.progressScale || 100);
@@ -267,72 +299,68 @@ export function processVideo(
       }
     });
 
-    // STALL DETECTION
     const stallCheck = setInterval(() => {
-      /**
-       * Stall detection is based on lack of FFmpeg progress, not total duration.
-       * Set FFMPEG_STALL_LIMIT_MS=0 to disable.
-       */
-      const STALL_LIMIT = Number(process.env.FFMPEG_STALL_LIMIT_MS || 30 * 60 * 1000);
+      const stallLimit = Number(process.env.FFMPEG_STALL_LIMIT_MS || 30 * 60 * 1000);
 
-      if (STALL_LIMIT > 0 && Date.now() - lastProgressTime > STALL_LIMIT) {
+      if (stallLimit > 0 && Date.now() - lastProgressTime > stallLimit) {
         const err = new Error('FFmpeg stalled');
-        logger.error('FFmpeg stalled', { jobId: options?.jobId, input, output, lastStderr: stderrBuffer.getLines() });
+        logger.error('FFmpeg stalled', {
+          jobId: options?.jobId,
+          input,
+          output,
+          lastStderr: stderrBuffer.getLines(),
+        });
         ffmpeg.kill('SIGKILL');
         safeReject(err);
       }
     }, 60_000);
 
-    /**
-     * Optional hard timeout.
-     *
-     * Default is disabled because valid 5GB+ videos can take many hours.
-     * Set FFMPEG_MAX_RUNTIME_MS only if you explicitly want a ceiling.
-     */
     const maxRuntimeMs = Number(process.env.FFMPEG_MAX_RUNTIME_MS || 0);
 
     const hardTimeout =
       maxRuntimeMs > 0
         ? setTimeout(() => {
-          const err = new Error("FFmpeg max runtime exceeded");
-          logger.error("FFmpeg max runtime exceeded", {
-            jobId: options?.jobId,
-            input,
-            output,
-            maxRuntimeMs,
-            lastStderr: stderrBuffer.getLines(),
-          });
-          ffmpeg.kill("SIGKILL");
-          safeReject(err);
-        }, maxRuntimeMs)
+            const err = new Error('FFmpeg max runtime exceeded');
+            logger.error('FFmpeg max runtime exceeded', {
+              jobId: options?.jobId,
+              input,
+              output,
+              maxRuntimeMs,
+              lastStderr: stderrBuffer.getLines(),
+            });
+            ffmpeg.kill('SIGKILL');
+            safeReject(err);
+          }, maxRuntimeMs)
         : null;
 
     ffmpeg.on('close', (code) => {
-      if (code === 0) safeResolve();
-      else {
-        logger.error('FFmpeg failed', { jobId: options?.jobId, exitCode: code, input, output, lastStderr: stderrBuffer.getLines() });
+      if (code === 0) {
+        safeResolve();
+      } else {
+        logger.error('FFmpeg failed', {
+          jobId: options?.jobId,
+          exitCode: code,
+          input,
+          output,
+          lastStderr: stderrBuffer.getLines(),
+        });
         safeReject(new Error(`FFmpeg failed with code ${code}`));
       }
     });
 
     ffmpeg.on('error', (err) => {
-      logger.error('FFmpeg spawn error', { jobId: options?.jobId, error: err, input, output, lastStderr: stderrBuffer.getLines() });
+      logger.error('FFmpeg spawn error', {
+        jobId: options?.jobId,
+        error: err,
+        input,
+        output,
+        lastStderr: stderrBuffer.getLines(),
+      });
       safeReject(err);
     });
   });
 }
 
-/**
- * Extracts video duration using ffprobe.
- *
- * Notes:
- * - Returns duration in milliseconds
- * - Used for progress normalization in higher-level logic
- * - Blocking call (acceptable due to short execution time)
- *
- * @param file Absolute file path
- * @returns Duration in milliseconds
- */
 export function getDuration(file: string): number {
   const probe = inspectVideoInput(file);
   return probe.durationMs ?? 0;
