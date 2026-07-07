@@ -749,6 +749,7 @@ export async function handleJob(
       const result = await withCpuSlot(() =>
         processImage(safeInput, outputBase, {
           watermarkText,
+          compress: job.isLargeFile,
         }),
       );
       outputPath = result.outputPath;
@@ -794,6 +795,7 @@ export async function handleJob(
             width: videoProbe?.width ?? null,
             height: videoProbe?.height ?? null,
             watermarkText,
+            isLargeFile: job.isLargeFile,
           },
           (progress) => {
             const normalized = Math.max(0, Math.min(Math.round(progress), 100));

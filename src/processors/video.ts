@@ -155,11 +155,13 @@ export async function processVideo(
     width?: number | null;
     height?: number | null;
     watermarkText?: string;
+    isLargeFile?: boolean;
   },
   onProgress?: (progress: number) => void,
 ): Promise<void> {
   const outputWidth = evenDimension(options?.width, 1280);
   const outputHeight = evenDimension(options?.height, 720);
+  const isLargeFile = options?.isLargeFile ?? false;
 
   const overlayPath = await createRepeatedWatermarkOverlayFile(
     options?.jobId || 'video',
@@ -196,7 +198,9 @@ export async function processVideo(
        * Overlay is full-canvas and low opacity, so review remains usable.
        */
       '-filter_complex',
-      `[0:v:0]scale=${outputWidth}:${outputHeight}[base];[base][1:v:0]overlay=0:0[vout]`,
+      isLargeFile
+        ? `[0:v:0]scale=-2:360[base];[base][1:v:0]overlay=0:0[vout]`
+        : `[0:v:0]scale=${outputWidth}:${outputHeight}[base];[base][1:v:0]overlay=0:0[vout]`,
 
       '-map',
       '[vout]',
@@ -210,7 +214,7 @@ export async function processVideo(
       '-preset',
       'fast',
       '-crf',
-      '25',
+      isLargeFile ? '28' : '18',
       '-pix_fmt',
       'yuv420p',
 

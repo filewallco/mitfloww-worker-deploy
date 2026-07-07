@@ -4,6 +4,7 @@ import {
   createRepeatedWatermarkOverlay,
   getDefaultWatermarkText,
 } from '../utils/watermark';
+import path from 'path/win32';
 
 type ImageOutputPlan = {
   ext: string;
@@ -87,6 +88,7 @@ export async function processImage(
   outputBase: string,
   options?: {
     watermarkText?: string;
+    compress?: boolean;
   },
 ): Promise<{ ext: string; outputPath: string }> {
   const probe = sharp(input, {
@@ -109,16 +111,18 @@ export async function processImage(
   const image = sharp(input, {
     animated: (metadata.pages || 1) > 1,
     limitInputPixels: config.security.maxImagePixels,
-  })
-    .rotate()
-    .resize({
+  }).rotate();
+
+  if (options?.compress) {
+    image.resize({
       width: targetWidth,
       withoutEnlargement: true,
     });
+  }
 
   const overlay = await createRepeatedWatermarkOverlay({
-    width: targetWidth,
-    height: targetHeight,
+    width: options?.compress ? targetWidth : (metadata.width || targetWidth),
+    height: options?.compress ? targetHeight : (metadata.height || targetHeight),
     text: options?.watermarkText || getDefaultWatermarkText(),
     opacity: Number(process.env.IMAGE_WATERMARK_OPACITY || 0.16),
     density: 'normal',
@@ -133,11 +137,28 @@ export async function processImage(
     },
   ]);
 
-  const plan = buildImageOutputPlan(metadata);
-  const ext = plan.ext;
-  const outputPath = `${outputBase}${ext}`;
+  const outputPath = `${outputBase}${path.extname(input) || ".png"}`;
 
-  await plan.apply(pipeline).toFile(outputPath);
+  if (options?.compress) {
+    const plan = buildImageOutputPlan(metadata);
+    await plan.apply(pipeline).toFile(outputPath);
 
-  return { ext, outputPath };
+    return {
+      ext: plan.ext,
+      outputPath: `${outputBase}${plan.ext}`,
+    };
+  }
+
+  const originalExt =
+    path.extname(input) ||
+    (metadata.format ? `.${metadata.format}` : ".png");
+
+  const finalOutput = `${outputBase}${originalExt}`;
+
+  await pipeline.toFile(finalOutput);
+
+  return {
+    ext: originalExt,
+    outputPath: finalOutput,
+  };
 }

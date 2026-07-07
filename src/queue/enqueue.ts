@@ -142,6 +142,8 @@ export async function enqueueFile(job: FileJob) {
       callbackUrl: job.callbackUrl ?? "",
       callbackToken: job.callbackToken ?? "",
       queueName,
+      isLargeFile: job.isLargeFile ? "1" : "0",
+      isPreviewGeneration: job.isPreviewGeneration ? "1" : "0",
     });
   } catch (e) {
     logger.error("REDIS WRITE FAILED", { error: e });

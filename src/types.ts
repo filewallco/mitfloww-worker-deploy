@@ -57,6 +57,18 @@ export interface FileJob {
   callbackUrl?: string;
   // Optional token for authenticating callback requests, ensuring that only authorized services can receive notifications
   callbackToken?: string;
+
+  /**
+   * Compress to 360p and watermark.
+   * When false, only watermark is applied.
+   */
+  isLargeFile?: boolean;
+
+  /**
+   * Generate preview assets.
+   * Admin-only feature.
+   */
+  isPreviewGeneration?: boolean;
 }
 
 /**
