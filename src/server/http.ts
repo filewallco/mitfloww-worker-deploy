@@ -307,6 +307,7 @@ export function startAdminServer() {
           "mimeType",
           "extension",
           "callbackUrl",
+          "isLargeFile"
         ];
 
         for (const key of required) {
@@ -339,6 +340,7 @@ export function startAdminServer() {
           userName: body.user?.name || null,
           callbackUrl: body.callbackUrl,
           callbackToken: process.env.PROCESSING_CALLBACK_TOKEN || body.callbackToken || "",
+          isLargeFile: Boolean(body.isLargeFile),
         });
 
         res.writeHead(202, { "Content-Type": "application/json" });
