@@ -399,8 +399,10 @@ export async function recoverStuckJobs() {
 
       const userTier =
         meta.userTier === "free" ||
-        meta.userTier === "premium" ||
-        meta.userTier === "vip"
+        meta.userTier === "basic" ||
+        meta.userTier === "pro" ||
+        meta.userTier === "studio" ||
+        meta.userTier === "business"
           ? meta.userTier
           : "free";
 

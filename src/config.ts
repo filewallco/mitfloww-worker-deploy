@@ -93,9 +93,11 @@ export const config = {
   wsToken: process.env.WS_TOKEN || process.env.ADMIN_TOKEN || '',
 
   userLimits: {
-    free: num('USER_LIMIT_FREE', 2),
-    premium: num('USER_LIMIT_PREMIUM', 4),
-    vip: num('USER_LIMIT_VIP', 6),
+    free: num("USER_LIMIT_FREE", 2),
+    basic: num("USER_LIMIT_BASIC", 2),
+    pro: num("USER_LIMIT_PRO", 4),
+    studio: num("USER_LIMIT_STUDIO", 6),
+    business: num("USER_LIMIT_BUSINESS", 8),
   },
 };
 

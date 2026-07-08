@@ -334,7 +334,7 @@ export function startAdminServer() {
           extension: body.extension,
           size: Number(body.sizeBytes),
           fileType,
-          userTier: body.user?.tier || "free",
+          userTier: body.user?.tier ?? "free",
           userId: body.user?.id || body.user?.email || "anonymous",
           userEmail: body.user?.email || null,
           userName: body.user?.name || null,

@@ -560,7 +560,7 @@ export async function handleJob(
       },
     );
 
-    const userLimit = config.userLimits[job.userTier] || config.userLimits.free;
+    const userLimit = config.userLimits[job.userTier] ?? config.userLimits.free;
     userSlotHeld = await tryAcquireUserSlot(userId, job.fileId, userLimit);
     if (!userSlotHeld) {
       throw new ResourceUnavailableError(

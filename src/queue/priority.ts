@@ -15,7 +15,7 @@ export function classify(size: number): 'small' | 'medium' | 'large' {
 
 /**
  * Computes base priority for a job based on:
- * 1. User tier: VIP < Premium < Free
+ * 1. User tier: Business < Studio < Pro < Basic < Free
  * 2. File size: Small < Medium < Large
  * Lower values indicate higher priority
  *
@@ -26,10 +26,12 @@ export function basePriority(job: FileJob): number {
   if (job.fileType === FILE_TYPE.IMAGE) return -10;
   const sizeType = classify(job.size);
 
-  const tierWeight = {
-    vip: 0,
-    premium: 1,
-    free: 2,
+  const tierWeight: Record<string, number> = {
+      business: 0,
+      studio: 1,
+      pro: 2,
+      basic: 3,
+      free: 4,
   };
 
   const sizeWeight = {
@@ -38,7 +40,9 @@ export function basePriority(job: FileJob): number {
     large: 2,
   };
 
-  return tierWeight[job.userTier] * 10 + sizeWeight[sizeType];
+  const tier = tierWeight[job.userTier] ?? tierWeight.free;
+
+  return tier * 10 + sizeWeight[sizeType];
 }
 
 /**
