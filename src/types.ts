@@ -40,7 +40,7 @@ export interface FileJob {
   size: number;
 
   // User information for tracking and access control
-  userTier:  "free" | "basic" | "pro" | "studio" | "business";
+  userTier:  "free" | "standard" | "pro" | "studio" | "business";
   // Unique identifier for the user who submitted the file processing job
   userId: string;
   // Optional email of the user, which can be used for notifications or logging

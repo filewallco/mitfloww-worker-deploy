@@ -15,7 +15,7 @@ export function classify(size: number): 'small' | 'medium' | 'large' {
 
 /**
  * Computes base priority for a job based on:
- * 1. User tier: Business < Studio < Pro < Basic < Free
+ * 1. User tier: Business < Studio < Pro < Standard < Free
  * 2. File size: Small < Medium < Large
  * Lower values indicate higher priority
  *
@@ -30,7 +30,7 @@ export function basePriority(job: FileJob): number {
       business: 0,
       studio: 1,
       pro: 2,
-      basic: 3,
+      standard: 3,
       free: 4,
   };
 

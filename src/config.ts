@@ -94,7 +94,7 @@ export const config = {
 
   userLimits: {
     free: num("USER_LIMIT_FREE", 2),
-    basic: num("USER_LIMIT_BASIC", 2),
+    standard: num("USER_LIMIT_STANDARD", 2),
     pro: num("USER_LIMIT_PRO", 4),
     studio: num("USER_LIMIT_STUDIO", 6),
     business: num("USER_LIMIT_BUSINESS", 8),
