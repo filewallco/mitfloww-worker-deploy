@@ -182,6 +182,8 @@ export async function processVideo(
       ...(options?.start ? ['-ss', String(options.start)] : []),
 
       ...LOCAL_INPUT_ARGS,
+      '-threads',
+      String(getFfmpegThreads()),
       '-fflags',
       '+genpts',
       '-i',
@@ -199,8 +201,8 @@ export async function processVideo(
        */
       '-filter_complex',
       isLargeFile
-        ? `[0:v:0]scale=-2:360[base];[base][1:v:0]overlay=0:0[vout]`
-        : `[0:v:0]scale=${outputWidth}:${outputHeight}[base];[base][1:v:0]overlay=0:0[vout]`,
+        ? `[0:v:0]scale=-2:360:flags=fast_bilinear[base];[base][1:v:0]overlay=0:0[vout]`
+        : `[0:v:0]scale=${outputWidth}:${outputHeight}:flags=fast_bilinear[base];[base][1:v:0]overlay=0:0[vout]`,
 
       '-map',
       '[vout]',
@@ -212,7 +214,8 @@ export async function processVideo(
       '-c:v',
       'libx264',
       '-preset',
-      'fast',
+      isLargeFile ? 'ultrafast' : 'fast',
+      ...(isLargeFile ? ['-tune', 'fastdecode'] : []),
       '-crf',
       isLargeFile ? '28' : '18',
       '-pix_fmt',

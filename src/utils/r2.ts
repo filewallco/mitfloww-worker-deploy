@@ -7,6 +7,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { config } from '../config';
 import { tryAcquireUploadSlot, releaseUploadSlot } from '../worker/resourceManager';
 
@@ -168,23 +169,25 @@ export async function uploadToR2(input: {
 
   try {
     const fileStream = fs.createReadStream(input.filePath);
-    if (input.onProgress) {
-      let uploadedBytes = 0;
-      fileStream.on('data', (chunk) => {
-        uploadedBytes += chunk.length;
-        input.onProgress!(uploadedBytes, stat.size);
-      });
-    }
-
-    await getClient().send(
-      new PutObjectCommand({
+    const upload = new Upload({
+      client: getClient(),
+      params: {
         Bucket: input.bucket,
         Key: input.key,
         Body: fileStream,
-        ContentLength: stat.size,
         ContentType: input.contentType ?? contentTypeFromKey(input.key),
-      }),
-    );
+      },
+    });
+
+    if (input.onProgress) {
+      upload.on('httpUploadProgress', (progress) => {
+        if (progress.loaded) {
+          input.onProgress!(progress.loaded, stat.size);
+        }
+      });
+    }
+
+    await upload.done();
 
     return {
       bucket: input.bucket,

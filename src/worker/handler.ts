@@ -413,6 +413,8 @@ export async function handleJob(
   const lockKey = REDIS_KEYS.LOCK(job.fileId);
   const jobKey = REDIS_KEYS.JOB(job.fileId);
   const context: HandleContext = { bullJob, token, startTime, jobKey };
+
+  logger.info("Job started", { jobId: job.fileId, fileType: job.fileType, size: job.size });
   const userId = job.userId || "local-user";
   const cpuLane: CpuLane = (() => {
     if (job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF) {
@@ -932,6 +934,8 @@ export async function handleJob(
       bullJob,
     });
 
+    logger.info("Job completed successfully", { jobId: job.fileId, durationMs });
+
     await recordProcessingDuration(
       job.fileType,
       expectedSourceBytes ?? job.size,
@@ -1022,6 +1026,7 @@ export async function handleJob(
             errorCode: scheduleError.code,
             errorMessage: scheduleError.publicMessage,
           });
+          logger.error("Job failed with resource wait timeout", { jobId: job.fileId, error: scheduleError });
           throw new UnrecoverableError(scheduleError.publicMessage);
         }
         throw scheduleError;
@@ -1038,6 +1043,7 @@ export async function handleJob(
         errorCode: normalized.code,
         errorMessage: normalized.publicMessage,
       });
+      logger.error("Job failed with resource wait timeout", { jobId: job.fileId, error: normalized });
       throw new UnrecoverableError(normalized.publicMessage);
     }
 
@@ -1055,6 +1061,7 @@ export async function handleJob(
         errorCode: normalized.code,
         errorMessage: normalized.publicMessage,
       });
+      logger.error("Job failed with known unrecoverable error", { jobId: job.fileId, error: normalized });
       throw new UnrecoverableError(normalized.publicMessage);
     }
 
@@ -1075,6 +1082,13 @@ export async function handleJob(
         errorMessage: toPublicErrorMessage(transientError.message),
       });
     }
+
+    logger.error("Job processing failed", { 
+      jobId: job.fileId, 
+      shouldRetry,
+      error: transientError,
+      rawError 
+    });
 
     throw transientError;
   } finally {
