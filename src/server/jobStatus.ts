@@ -10,6 +10,9 @@ export type PublicJobStatus = {
   status: string;
   stage: string | null;
   progress: number;
+  downloadProgress: number | null;
+  processingProgress: number | null;
+  uploadProgress: number | null;
   queueName: string | null;
   queuePosition: number | null;
   queueSize: number | null;
@@ -211,12 +214,19 @@ export async function getPublicJobStatus(id: string): Promise<PublicJobStatus | 
       ? now + etaMs
       : null;
 
+  const downloadProgress = meta.downloadProgress != null ? toNumber(meta.downloadProgress) : null;
+  const processingProgress = meta.processingProgress != null ? toNumber(meta.processingProgress) : null;
+  const uploadProgress = meta.uploadProgress != null ? toNumber(meta.uploadProgress) : null;
+
   return {
     jobId: id,
     fileVersionId: meta.fileVersionId || null,
     status,
     stage,
     progress,
+    downloadProgress,
+    processingProgress,
+    uploadProgress,
     queueName: queueName || null,
     queuePosition: queueSnapshot.queuePosition,
     queueSize: queueSnapshot.queueSize,
@@ -248,6 +258,9 @@ export async function getPublicJobStatuses(ids: string[]): Promise<PublicJobStat
       status: 'not_found',
       stage: null,
       progress: 0,
+      downloadProgress: null,
+      processingProgress: null,
+      uploadProgress: null,
       queueName: null,
       queuePosition: null,
       queueSize: null,

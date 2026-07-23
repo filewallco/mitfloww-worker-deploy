@@ -85,6 +85,7 @@ export async function downloadFromR2(input: {
   dest: string;
   expectedBytes?: number | null;
   maxBytes?: number;
+  onProgress?: (bytes: number, total?: number) => void;
 }) {
   const result = await getClient().send(
     new GetObjectCommand({
@@ -115,6 +116,10 @@ export async function downloadFromR2(input: {
 
     body.on('data', (chunk: Buffer) => {
       writtenBytes += chunk.length;
+
+      if (input.onProgress) {
+        input.onProgress(writtenBytes, expectedBytes ?? undefined);
+      }
 
       if (writtenBytes > maxBytes) {
         body.destroy(new Error('Download exceeds maximum upload size'));
@@ -148,6 +153,7 @@ export async function uploadToR2(input: {
   filePath: string;
   contentType?: string;
   holderId: string;
+  onProgress?: (bytes: number, total: number) => void;
 }) {
   const stat = await fs.promises.stat(input.filePath);
 
@@ -161,11 +167,20 @@ export async function uploadToR2(input: {
   }
 
   try {
+    const fileStream = fs.createReadStream(input.filePath);
+    if (input.onProgress) {
+      let uploadedBytes = 0;
+      fileStream.on('data', (chunk) => {
+        uploadedBytes += chunk.length;
+        input.onProgress!(uploadedBytes, stat.size);
+      });
+    }
+
     await getClient().send(
       new PutObjectCommand({
         Bucket: input.bucket,
         Key: input.key,
-        Body: fs.createReadStream(input.filePath),
+        Body: fileStream,
         ContentLength: stat.size,
         ContentType: input.contentType ?? contentTypeFromKey(input.key),
       }),
@@ -206,7 +221,12 @@ export async function uploadJsonToR2(input: {
   };
 }
 
-export async function upload(filePath: string, key: string, holderId: string): Promise<string> {
+export async function upload(
+  filePath: string,
+  key: string,
+  holderId: string,
+  onProgress?: (bytes: number, total: number) => void
+): Promise<string> {
   if (config.mode === 'local') {
     const outputDir = path.resolve('./outputs');
     const dest = path.resolve(outputDir, key);
@@ -216,7 +236,27 @@ export async function upload(filePath: string, key: string, holderId: string): P
     }
 
     await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-    await fs.promises.copyFile(filePath, dest);
+    
+    if (onProgress) {
+      const stat = await fs.promises.stat(filePath);
+      const readStream = fs.createReadStream(filePath);
+      const writeStream = fs.createWriteStream(dest);
+      let uploadedBytes = 0;
+      
+      readStream.on('data', (chunk) => {
+        uploadedBytes += chunk.length;
+        onProgress(uploadedBytes, stat.size);
+      });
+
+      await new Promise((resolve, reject) => {
+        readStream.pipe(writeStream);
+        writeStream.on('finish', resolve);
+        writeStream.on('error', reject);
+        readStream.on('error', reject);
+      });
+    } else {
+      await fs.promises.copyFile(filePath, dest);
+    }
     return dest;
   }
 
@@ -225,14 +265,14 @@ export async function upload(filePath: string, key: string, holderId: string): P
     throw new Error('R2_BUCKET_NAME is required.');
   }
 
-  await uploadToR2({ bucket, key, filePath, holderId });
+  await uploadToR2({ bucket, key, filePath, holderId, onProgress });
   return key;
 }
 
 export async function download(
   inputUrl: string,
   dest: string,
-  options?: { expectedBytes?: number | null; maxBytes?: number },
+  options?: { expectedBytes?: number | null; maxBytes?: number; onProgress?: (bytes: number, total?: number) => void; },
 ): Promise<void> {
   await fs.promises.mkdir(path.dirname(dest), { recursive: true });
   const maxBytes = options?.maxBytes ?? config.security.maxUploadBytes;
@@ -292,6 +332,11 @@ export async function download(
           }
 
           downloadedBytes += value.byteLength;
+
+          if (options?.onProgress) {
+            options.onProgress(downloadedBytes, expectedBytes ?? undefined);
+          }
+
           if (downloadedBytes > maxBytes) {
             file.destroy();
             reject(new Error('Download exceeds maximum upload size'));
