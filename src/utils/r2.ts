@@ -9,6 +9,7 @@ import {
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { config } from '../config';
+import { logger } from './logger';
 import { tryAcquireUploadSlot, releaseUploadSlot } from '../worker/resourceManager';
 
 let client: S3Client | null = null;
@@ -28,6 +29,10 @@ function getClient() {
       endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
       forcePathStyle: true,
       region: 'auto',
+      requestHandler: {
+        requestTimeout: 0, // disable per-request timeout — Upload manages retries itself
+      } as any,
+      maxAttempts: 5,
     });
   }
 
@@ -88,6 +93,8 @@ export async function downloadFromR2(input: {
   maxBytes?: number;
   onProgress?: (bytes: number, total?: number) => void;
 }) {
+  logger.info('R2 download started', { bucket: input.bucket, key: input.key, expectedBytes: input.expectedBytes });
+
   const result = await getClient().send(
     new GetObjectCommand({
       Bucket: input.bucket,
@@ -111,6 +118,7 @@ export async function downloadFromR2(input: {
 
   await new Promise<void>((resolve, reject) => {
     const fail = (error: unknown) => {
+      logger.error('R2 download stream error', { bucket: input.bucket, key: input.key, writtenBytes, error });
       file.destroy();
       reject(error);
     };
@@ -123,12 +131,16 @@ export async function downloadFromR2(input: {
       }
 
       if (writtenBytes > maxBytes) {
-        body.destroy(new Error('Download exceeds maximum upload size'));
+        const err = new Error('Download exceeds maximum upload size');
+        logger.error('R2 download exceeded maxBytes', { bucket: input.bucket, key: input.key, writtenBytes, maxBytes });
+        body.destroy(err);
         return;
       }
 
       if (expectedBytes && writtenBytes > expectedBytes) {
-        body.destroy(new Error('Download exceeds expected content length'));
+        const err = new Error('Download exceeds expected content length');
+        logger.error('R2 download exceeded expectedBytes', { bucket: input.bucket, key: input.key, writtenBytes, expectedBytes });
+        body.destroy(err);
         return;
       }
 
@@ -140,11 +152,16 @@ export async function downloadFromR2(input: {
 
     body.once('error', fail);
     file.once('error', fail);
-    body.once('end', () => file.end(resolve));
+    body.once('end', () => file.end(() => {
+      logger.info('R2 download complete', { bucket: input.bucket, key: input.key, writtenBytes });
+      resolve();
+    }));
   });
 
   if (expectedBytes && writtenBytes !== expectedBytes) {
-    throw new Error(`Downloaded bytes mismatch. expected=${expectedBytes} actual=${writtenBytes}`);
+    const msg = `Downloaded bytes mismatch. expected=${expectedBytes} actual=${writtenBytes}`;
+    logger.error('R2 download byte mismatch', { bucket: input.bucket, key: input.key, expectedBytes, writtenBytes });
+    throw new Error(msg);
   }
 }
 
@@ -159,8 +176,20 @@ export async function uploadToR2(input: {
   const stat = await fs.promises.stat(input.filePath);
 
   if (!stat.isFile() || stat.size > config.security.maxOutputBytes) {
+    logger.error('R2 upload rejected: file exceeds size limit or is not a file', {
+      filePath: input.filePath,
+      size: stat.isFile() ? stat.size : 'not a file',
+      maxOutputBytes: config.security.maxOutputBytes,
+    });
     throw new Error('Output file exceeds allowed size');
   }
+
+  logger.info('R2 upload starting', {
+    bucket: input.bucket,
+    key: input.key,
+    sizeBytes: stat.size,
+    filePath: input.filePath,
+  });
 
   const holderId = input.holderId;
   while (!(await tryAcquireUploadSlot(holderId))) {
@@ -169,8 +198,15 @@ export async function uploadToR2(input: {
 
   try {
     const fileStream = fs.createReadStream(input.filePath);
+
+    // Use 10MB parts for large files, 5MB minimum (R2 minimum is 5MB per part)
+    const partSizeBytes = Math.max(5 * 1024 * 1024, Math.ceil(stat.size / 1000));
+
     const upload = new Upload({
       client: getClient(),
+      queueSize: 4,           // 4 concurrent part uploads
+      partSize: partSizeBytes, // dynamic part size
+      leavePartsOnError: false,
       params: {
         Bucket: input.bucket,
         Key: input.key,
@@ -179,15 +215,25 @@ export async function uploadToR2(input: {
       },
     });
 
-    if (input.onProgress) {
-      upload.on('httpUploadProgress', (progress) => {
-        if (progress.loaded) {
-          input.onProgress!(progress.loaded, stat.size);
-        }
+    upload.on('httpUploadProgress', (progress) => {
+      logger.info('R2 upload progress', {
+        key: input.key,
+        loaded: progress.loaded,
+        total: progress.total ?? stat.size,
+        part: progress.part,
       });
-    }
+      if (input.onProgress && progress.loaded) {
+        input.onProgress(progress.loaded, stat.size);
+      }
+    });
 
     await upload.done();
+
+    logger.info('R2 upload complete', {
+      bucket: input.bucket,
+      key: input.key,
+      sizeBytes: stat.size,
+    });
 
     return {
       bucket: input.bucket,
@@ -195,6 +241,15 @@ export async function uploadToR2(input: {
       sizeBytes: stat.size,
       contentType: input.contentType ?? contentTypeFromKey(input.key),
     };
+  } catch (err) {
+    logger.error('R2 upload failed', {
+      bucket: input.bucket,
+      key: input.key,
+      sizeBytes: stat.size,
+      filePath: input.filePath,
+      error: err,
+    });
+    throw err;
   } finally {
     await releaseUploadSlot(holderId);
   }
