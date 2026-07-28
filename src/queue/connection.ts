@@ -1,6 +1,6 @@
-import IORedis from 'ioredis';
-import { config } from '../config';
-import { logger } from '../utils/logger';
+import IORedis from "ioredis";
+import { config } from "../config";
+import { logger } from "../utils/logger";
 
 /**
  * Redis connection instance using ioredis.
@@ -8,28 +8,46 @@ import { logger } from '../utils/logger';
  *
  * maxRetriesPerRequest: null disables automatic retries to prevent blocking on failed commands.
  */
-export const connection = new IORedis({
-  host: config.redis.host,
-  port: config.redis.port,
+const redis =
+  process.env.REDIS_URL
+    ? new IORedis(process.env.REDIS_URL, {
+        maxRetriesPerRequest: null,
 
-  maxRetriesPerRequest: null,
+        retryStrategy(times) {
+          const delay = Math.min(times * 100, 3000);
+          logger.warn("Redis retry attempt", { attempt: times, delay });
+          return delay;
+        },
 
-  retryStrategy(times) {
-    const delay = Math.min(times * 100, 3000);
-    logger.warn('Redis retry attempt', { attempt: times, delay });
-    return delay;
-  },
+        reconnectOnError(err) {
+          logger.error("Redis reconnect on error", { message: err.message });
+          return true;
+        },
+      })
+    : new IORedis({
+        host: config.redis.host,
+        port: config.redis.port,
 
-  reconnectOnError(err) {
-    logger.error('Redis reconnect on error', { message: err.message });
-    return true;
-  }
+        maxRetriesPerRequest: null,
+
+        retryStrategy(times) {
+          const delay = Math.min(times * 100, 3000);
+          logger.warn("Redis retry attempt", { attempt: times, delay });
+          return delay;
+        },
+
+        reconnectOnError(err) {
+          logger.error("Redis reconnect on error", { message: err.message });
+          return true;
+        },
+      });
+
+export const connection = redis;
+
+connection.on("error", (err) => {
+  logger.error("Redis error", { error: err });
 });
 
-connection.on('error', (err) => {
-  logger.error('Redis error', { error: err });
-});
-
-connection.on('connect', () => {
-  logger.info('Redis connected');
+connection.on("connect", () => {
+  logger.info("Redis connected");
 });
