@@ -17,6 +17,13 @@ import { reconcileResourceHolders } from './worker/resourceManager';
 
 process.env.SESSION_ID = Date.now().toString();
 
+logger.info("Worker starting", {
+  mode: config.mode,
+  node: process.version,
+  sessionId: process.env.SESSION_ID,
+  redisUrl: !!process.env.REDIS_URL,
+});
+
 /**
  * Entry point for MitFloww.
  *
@@ -38,9 +45,21 @@ if (config.mode === "local" && process.env.ENABLE_LOCAL_TEST === "true") {
 
 logger.info(`Running in ${config.mode} mode`, { mode: config.mode });
 
-startAdminServer();
-startWS();
-startPriorityScheduler();
+try {
+  logger.info("Starting admin server");
+  startAdminServer();
+
+  logger.info("Starting WebSocket server");
+  startWS();
+
+  logger.info("Starting priority scheduler");
+  startPriorityScheduler();
+
+  logger.info("Worker startup complete");
+} catch (err) {
+  logger.fatal("Startup failed", { error: err });
+  process.exit(1);
+}
 
 setInterval(() => {
   reconcileResourceHolders().catch((err) =>
