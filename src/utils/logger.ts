@@ -70,14 +70,31 @@ class Logger {
       this.rotateIfNeeded();
 
       const time = new Date().toISOString();
-      const metaStr = meta ? ` ${safeSerialize(meta)}` : '';
-      const line = `[${time}] [${level}] ${message}${metaStr}\n`;
+      const metaStr = meta ? ` ${safeSerialize(meta)}` : "";
+      const line = `[${time}] [${level}] ${message}${metaStr}`;
 
+      // Console output (Render captures this)
+      switch (level) {
+        case "ERROR":
+        case "FATAL":
+          console.error(line);
+          break;
+        case "WARN":
+          console.warn(line);
+          break;
+        default:
+          console.log(line);
+      }
+
+      // File output (local only)
       if (this.stream) {
-        this.stream.write(line);
+        this.stream.write(line + "\n");
       } else {
-        // Fallback to appendFile if stream couldn't be created
-        fs.appendFile(path.join(LOG_DIR, `${this.currentDate || new Date().toISOString().slice(0,10)}.log`), line, () => {});
+        fs.appendFile(
+          path.join(LOG_DIR, `${this.currentDate || new Date().toISOString().slice(0, 10)}.log`),
+          line + "\n",
+          () => { }
+        );
       }
     } catch {
       // Never throw from logger
