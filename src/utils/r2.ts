@@ -11,28 +11,45 @@ import { Upload } from '@aws-sdk/lib-storage';
 import { config } from '../config';
 import { logger } from './logger';
 import { tryAcquireUploadSlot, releaseUploadSlot } from '../worker/resourceManager';
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 
 let client: S3Client | null = null;
 
 function getClient() {
   if (!client) {
-    const accountId = process.env.R2_ACCOUNT_ID;
-    const accessKeyId = process.env.R2_ACCESS_KEY_ID;
-    const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+    const accountId = process.env.R2_ACCOUNT_ID?.trim();
+    const accessKeyId = process.env.R2_ACCESS_KEY_ID?.trim();
+    const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY?.trim();
 
     if (!accountId || !accessKeyId || !secretAccessKey) {
-      throw new Error('R2 credentials are missing.');
+      throw new Error("R2 credentials are missing.");
     }
 
+    const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
+
+      // TODO: temp remove
+    logger.info("R2 Configuration", {
+      endpoint,
+      accountId,
+      bucket: process.env.R2_BUCKET_NAME,
+      node: process.version,
+      accessKeyPresent: !!accessKeyId,
+      secretPresent: !!secretAccessKey,
+    });
+
     client = new S3Client({
-      credentials: { accessKeyId, secretAccessKey },
-      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      region: "auto",
+      endpoint,
       forcePathStyle: true,
-      region: 'auto',
-      requestHandler: {
-        requestTimeout: 0, // disable per-request timeout — Upload manages retries itself
-      } as any,
+      credentials: {
+        accessKeyId,
+        secretAccessKey,
+      },
       maxAttempts: 5,
+      requestHandler: new NodeHttpHandler({
+        connectionTimeout: 30_000,
+        requestTimeout: 300_000,
+      }),
     });
   }
 
@@ -227,7 +244,23 @@ export async function uploadToR2(input: {
       }
     });
 
-    await upload.done();
+    logger.info("Calling upload.done()", {
+      bucket: input.bucket,
+      key: input.key,
+    });
+
+    try {
+      await upload.done();
+    } catch (error) {
+      logger.error("upload.done() failed", {
+        bucket: input.bucket,
+        key: input.key,
+        endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+        error,
+      });
+
+      throw error;
+    }
 
     logger.info('R2 upload complete', {
       bucket: input.bucket,

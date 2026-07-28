@@ -149,6 +149,10 @@ async function updateJobStage(
 async function notifyCallback(job: FileJob, payload: Record<string, unknown>) {
   if (!job.callbackUrl) return;
 
+  logger.info("Calling callback", {
+      callbackUrl: job.callbackUrl
+  });
+
   await fetch(job.callbackUrl, {
     method: "POST",
     headers: {
@@ -522,7 +526,17 @@ export async function handleJob(
     );
     assertAllowedMediaInput(job.fileType, null, job.outputKey);
 
+    logger.info("Checking R2 object", {
+      bucket: job.sourceBucket,
+      key: job.sourceKey,
+    });
+
     const source = await resolveSourceMetadata(job);
+    
+    logger.info("R2 HEAD success", {
+      expectedBytes: source.expectedBytes,
+    });
+
     expectedSourceBytes = source.expectedBytes;
 
     const requiredDisk = estimateRequiredDisk(
@@ -656,6 +670,11 @@ export async function handleJob(
     };
 
     if (job.sourceBucket && job.sourceKey) {
+      logger.info("Starting download", {
+        bucket: job.sourceBucket,
+        key: job.sourceKey,
+      });
+
       await downloadFromR2({
         bucket: job.sourceBucket,
         key: job.sourceKey,
@@ -664,6 +683,8 @@ export async function handleJob(
         maxBytes: config.security.maxUploadBytes,
         onProgress: onDownloadProgress,
       });
+
+      logger.info("Download completed");
     } else if (job.inputUrl) {
       await download(job.inputUrl, rawInputPath, {
         expectedBytes: expectedSourceBytes,
@@ -912,6 +933,8 @@ export async function handleJob(
         bullJob,
       },
     );
+    
+    logger.info("Uploading output");
 
     const result = job.outputBucket
       ? await uploadToR2({
@@ -922,6 +945,8 @@ export async function handleJob(
           onProgress: onUploadProgress,
         })
       : await upload(outputPath, job.outputKey, `${job.fileId}:upload`, onUploadProgress);
+
+    logger.info("Upload finished");
 
     jobStatus = JOB_STATUS.COMPLETED;
     clearQueuedFileVersionIndex = true;
