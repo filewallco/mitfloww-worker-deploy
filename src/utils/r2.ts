@@ -26,17 +26,7 @@ function getClient() {
     }
 
     const endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
-
-      // TODO: temp remove
-    logger.info("R2 Configuration", {
-      endpoint,
-      accountId,
-      bucket: process.env.R2_BUCKET_NAME,
-      node: process.version,
-      accessKeyPresent: !!accessKeyId,
-      secretPresent: !!secretAccessKey,
-    });
-
+    
     client = new S3Client({
       region: "auto",
       endpoint,
