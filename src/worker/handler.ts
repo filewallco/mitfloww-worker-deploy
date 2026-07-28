@@ -413,6 +413,8 @@ export async function handleJob(
   const lockKey = REDIS_KEYS.LOCK(job.fileId);
   const jobKey = REDIS_KEYS.JOB(job.fileId);
   const context: HandleContext = { bullJob, token, startTime, jobKey };
+
+  logger.info("Job started", { jobId: job.fileId, fileType: job.fileType, size: job.size });
   const userId = job.userId || "local-user";
   const cpuLane: CpuLane = (() => {
     if (job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF) {
@@ -624,6 +626,35 @@ export async function handleJob(
       },
     );
 
+    let lastDownloadProgress = -1;
+    let lastDownloadProgressAt = 0;
+    const onDownloadProgress = (bytes: number, total?: number) => {
+      if (!total) return;
+      const progress = Math.round((bytes / total) * 100);
+      const normalized = Math.max(0, Math.min(progress, 100));
+      const now = Date.now();
+      if (normalized < 100) {
+        if (normalized <= lastDownloadProgress) return;
+        if (now - lastDownloadProgressAt < 750) return;
+      }
+      lastDownloadProgress = normalized;
+      lastDownloadProgressAt = now;
+      void updateJobStage(
+        job.fileId,
+        JOB_STATUS.PROCESSING,
+        JOB_STAGE.DOWNLOADING,
+        {
+          downloadProgress: normalized,
+          bullJob,
+        },
+      ).catch((progressError) => {
+        logger.error("Download progress update failed", {
+          jobId: job.fileId,
+          error: progressError,
+        });
+      });
+    };
+
     if (job.sourceBucket && job.sourceKey) {
       await downloadFromR2({
         bucket: job.sourceBucket,
@@ -631,11 +662,13 @@ export async function handleJob(
         dest: rawInputPath,
         expectedBytes: expectedSourceBytes,
         maxBytes: config.security.maxUploadBytes,
+        onProgress: onDownloadProgress,
       });
     } else if (job.inputUrl) {
       await download(job.inputUrl, rawInputPath, {
         expectedBytes: expectedSourceBytes,
         maxBytes: config.security.maxUploadBytes,
+        onProgress: onDownloadProgress,
       });
     } else {
       throw new SourceMissingError("Missing source object");
@@ -760,6 +793,7 @@ export async function handleJob(
         JOB_STAGE.PROCESSING,
         {
           progress: 100,
+          processingProgress: 100,
           bullJob,
         },
       );
@@ -777,6 +811,7 @@ export async function handleJob(
         JOB_STAGE.PROCESSING,
         {
           progress: 100,
+          processingProgress: 100,
           bullJob,
         },
       );
@@ -812,6 +847,7 @@ export async function handleJob(
               JOB_STAGE.PROCESSING,
               {
                 progress: normalized,
+                processingProgress: normalized,
                 bullJob,
               },
             ).catch((progressError) => {
@@ -830,6 +866,7 @@ export async function handleJob(
         JOB_STAGE.PROCESSING,
         {
           progress: 100,
+          processingProgress: 100,
           bullJob,
         },
       );
@@ -837,6 +874,35 @@ export async function handleJob(
     } else {
       throw new CorruptInputError(`Unsupported file type: ${job.fileType}`);
     }
+
+    let lastUploadProgress = -1;
+    let lastUploadProgressAt = 0;
+    const onUploadProgress = (bytes: number, total: number) => {
+      if (!total) return;
+      const progress = Math.round((bytes / total) * 100);
+      const normalized = Math.max(0, Math.min(progress, 100));
+      const now = Date.now();
+      if (normalized < 100) {
+        if (normalized <= lastUploadProgress) return;
+        if (now - lastUploadProgressAt < 750) return;
+      }
+      lastUploadProgress = normalized;
+      lastUploadProgressAt = now;
+      void updateJobStage(
+        job.fileId,
+        JOB_STATUS.UPLOADING,
+        JOB_STAGE.UPLOADING,
+        {
+          uploadProgress: normalized,
+          bullJob,
+        },
+      ).catch((progressError) => {
+        logger.error("Upload progress update failed", {
+          jobId: job.fileId,
+          error: progressError,
+        });
+      });
+    };
 
     await updateJobStage(
       job.fileId,
@@ -853,8 +919,9 @@ export async function handleJob(
           key: job.outputKey,
           filePath: outputPath,
           holderId: `${job.fileId}:upload`,
+          onProgress: onUploadProgress,
         })
-      : await upload(outputPath, job.outputKey, `${job.fileId}:upload`);
+      : await upload(outputPath, job.outputKey, `${job.fileId}:upload`, onUploadProgress);
 
     jobStatus = JOB_STATUS.COMPLETED;
     clearQueuedFileVersionIndex = true;
@@ -866,6 +933,8 @@ export async function handleJob(
       success: true,
       bullJob,
     });
+
+    logger.info("Job completed successfully", { jobId: job.fileId, durationMs });
 
     await recordProcessingDuration(
       job.fileType,
@@ -957,6 +1026,7 @@ export async function handleJob(
             errorCode: scheduleError.code,
             errorMessage: scheduleError.publicMessage,
           });
+          logger.error("Job failed with resource wait timeout", { jobId: job.fileId, error: scheduleError });
           throw new UnrecoverableError(scheduleError.publicMessage);
         }
         throw scheduleError;
@@ -973,6 +1043,7 @@ export async function handleJob(
         errorCode: normalized.code,
         errorMessage: normalized.publicMessage,
       });
+      logger.error("Job failed with resource wait timeout", { jobId: job.fileId, error: normalized });
       throw new UnrecoverableError(normalized.publicMessage);
     }
 
@@ -990,6 +1061,7 @@ export async function handleJob(
         errorCode: normalized.code,
         errorMessage: normalized.publicMessage,
       });
+      logger.error("Job failed with known unrecoverable error", { jobId: job.fileId, error: normalized });
       throw new UnrecoverableError(normalized.publicMessage);
     }
 
@@ -1010,6 +1082,13 @@ export async function handleJob(
         errorMessage: toPublicErrorMessage(transientError.message),
       });
     }
+
+    logger.error("Job processing failed", { 
+      jobId: job.fileId, 
+      shouldRetry,
+      error: transientError,
+      rawError 
+    });
 
     throw transientError;
   } finally {

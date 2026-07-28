@@ -163,6 +163,9 @@ export async function getSystemSnapshot() {
       id: job.id,
       state,
       progress,
+      downloadProgress: meta.downloadProgress ? Number(meta.downloadProgress) : null,
+      processingProgress: meta.processingProgress ? Number(meta.processingProgress) : null,
+      uploadProgress: meta.uploadProgress ? Number(meta.uploadProgress) : null,
       fileName: job.data?.inputUrl?.split(/[\\/]/).pop(),
       size: Number(meta.size || 0),
       queuePosition,
@@ -399,7 +402,7 @@ export async function recoverStuckJobs() {
 
       const userTier =
         meta.userTier === "free" ||
-        meta.userTier === "basic" ||
+        meta.userTier === "standard" ||
         meta.userTier === "pro" ||
         meta.userTier === "studio" ||
         meta.userTier === "business"

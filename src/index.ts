@@ -57,10 +57,10 @@ setInterval(async () => {
     const free = getFreeDiskSpace();
 
     if (free < config.disk.targetFreeBytes) {
-      console.log('Running disk cleanup...');
+      logger.info('Running disk cleanup, free space below target', { freeBytes: free, targetBytes: config.disk.targetFreeBytes });
       await cleanupTempDir();
     }
-    } catch (err) {
+  } catch (err) {
     logger.error('Cleanup error', { error: err });
   }
 }, 60_000); // every 1 min
