@@ -507,6 +507,17 @@ export async function handleJob(
     "NX",
   );
   if (lockResult !== "OK") {
+    //temp loggin instance
+    const existingOwner = await connection.get(lockKey);
+    const existingTtl = await connection.pttl(lockKey);
+
+    logger.info("Lock inspection", {
+      jobId: job.fileId,
+      lockKey,
+      existingOwner,
+      existingTtl,
+      currentWorker: WORKER_ID,
+    });
     logger.info("Skipping duplicate execution", { jobId: job.fileId });
     return;
   }
