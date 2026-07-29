@@ -3,6 +3,7 @@ import {
   degrees,
   PDFDocument,
   ParseSpeeds,
+  PDFImage,
   rgb,
   StandardFonts,
 } from 'pdf-lib';
@@ -66,6 +67,9 @@ function fitTextFontSize(input: {
   );
 }
 
+const yieldToEventLoop = () =>
+  new Promise<void>((resolve) => setImmediate(resolve));
+
 async function applyPdfWatermark(
   input: string,
   outputPath: string,
@@ -80,7 +84,8 @@ async function applyPdfWatermark(
   }
 
   const deadline = Date.now() + config.security.pdfProcessingTimeoutMs;
-  const pdfBytes = await fs.promises.readFile(input);
+
+  let pdfBytes = await fs.promises.readFile(input);
 
   assertDeadline(deadline);
 
@@ -102,6 +107,9 @@ async function applyPdfWatermark(
     throw new Error('Malformed PDF rejected');
   }
 
+  // Release the original file buffer as soon as possible.
+  pdfBytes = Buffer.alloc(0);
+
   const pages = pdfDoc.getPages();
 
   if (pages.length === 0 || pages.length > config.security.maxPdfPages) {
@@ -109,28 +117,47 @@ async function applyPdfWatermark(
   }
 
   const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
   const text = options?.watermarkText || getDefaultWatermarkText();
+
   const opacity = Math.max(
     0.06,
     Math.min(Number(process.env.PDF_WATERMARK_OPACITY || 0.14), 0.25),
   );
 
+  const logoWatermarkEnabled = isLogoWatermarkEnabled();
+
+  // Cache embedded overlays by page size
+  const overlayCache = new Map<string, PDFImage>();
+
   for (const page of pages) {
     assertDeadline(deadline);
 
     const { width: pageWidth, height: pageHeight } = page.getSize();
+
     assertPageSize(pageWidth, pageHeight);
 
-        if (isLogoWatermarkEnabled()) {
-      const overlay = await createRepeatedWatermarkOverlay({
-        width: Math.round(pageWidth),
-        height: Math.round(pageHeight),
-        text,
-        opacity,
-        density: 'light',
-      });
+    if (logoWatermarkEnabled) {
+      const roundedWidth = Math.round(pageWidth);
+      const roundedHeight = Math.round(pageHeight);
 
-      const overlayImage = await pdfDoc.embedPng(overlay);
+      const cacheKey =
+        `${roundedWidth}:${roundedHeight}:${text}:${opacity}:light`;
+
+      let overlayImage = overlayCache.get(cacheKey);
+
+      if (!overlayImage) {
+        const overlay = await createRepeatedWatermarkOverlay({
+          width: roundedWidth,
+          height: roundedHeight,
+          text,
+          opacity,
+          density: 'light',
+        });
+
+        overlayImage = await pdfDoc.embedPng(overlay);
+        overlayCache.set(cacheKey, overlayImage);
+      }
 
       page.drawImage(overlayImage, {
         x: 0,
@@ -139,7 +166,7 @@ async function applyPdfWatermark(
         height: pageHeight,
       });
 
-      await new Promise((resolve) => setImmediate(resolve));
+      await yieldToEventLoop();
       continue;
     }
 
@@ -150,12 +177,10 @@ async function applyPdfWatermark(
     });
 
     const textWidth = font.widthOfTextAtSize(text, fontSize);
-    const x = pageWidth / 2 - textWidth / 2;
-    const y = pageHeight / 2;
 
     page.drawText(text, {
-      x,
-      y,
+      x: pageWidth / 2 - textWidth / 2,
+      y: pageHeight / 2,
       size: fontSize,
       font,
       color: rgb(0.15, 0.15, 0.15),
@@ -163,7 +188,7 @@ async function applyPdfWatermark(
       rotate: degrees(-32),
     });
 
-    await new Promise((resolve) => setImmediate(resolve));
+    await yieldToEventLoop();
   }
 
   const outputBytes = await pdfDoc.save({
@@ -172,11 +197,16 @@ async function applyPdfWatermark(
     objectsPerTick: 50,
   });
 
+  overlayCache.clear();
+
   if (outputBytes.byteLength > config.security.maxOutputBytes) {
     throw new Error('PDF output exceeds safety size limit');
   }
 
   await fs.promises.writeFile(outputPath, outputBytes);
+
+  // Drop references for earlier GC in long-running workers
+  (pdfDoc as any) = null;
 }
 
 export async function processPdf(
