@@ -46,14 +46,23 @@ function resolveWatermarkLogoPath() {
   return path.resolve(process.cwd(), 'assets', 'watermark.png');
 }
 
+let cachedLogoBase64: string | null | undefined;
+
 function readLogoBase64() {
+  if (cachedLogoBase64 !== undefined) {
+    return cachedLogoBase64;
+  }
+
   const logoPath = resolveWatermarkLogoPath();
 
   if (!fs.existsSync(logoPath)) {
+    cachedLogoBase64 = null;
     return null;
   }
 
-  return fs.readFileSync(logoPath).toString('base64');
+  cachedLogoBase64 = fs.readFileSync(logoPath).toString("base64");
+
+  return cachedLogoBase64;
 }
 
 export function isLogoWatermarkEnabled() {
@@ -231,8 +240,19 @@ function createRepeatedLogoNodes(input: {
  *   repeated text only
  */
 export function createRepeatedWatermarkSvg(options: WatermarkOverlayOptions) {
-  const width = Math.max(1, Math.round(options.width));
-  const height = Math.max(1, Math.round(options.height));
+  const MAX_DIMENSION = 16384;
+
+  const width = clamp(
+      Math.round(options.width),
+      1,
+      MAX_DIMENSION,
+  );
+
+  const height = clamp(
+      Math.round(options.height),
+      1,
+      MAX_DIMENSION,
+  );
 
   const shorterSide = Math.min(width, height);
   const density = options.density || 'normal';
@@ -366,15 +386,20 @@ export async function createRepeatedWatermarkOverlayFile(
   jobId: string,
   options: WatermarkOverlayOptions,
 ) {
-  const overlay = await createRepeatedWatermarkOverlay(options);
+  const svg = createRepeatedWatermarkSvg(options);
 
-  const safeJobId = jobId.replace(/[^a-zA-Z0-9_-]/g, '');
+  const safeJobId = jobId.replace(/[^a-zA-Z0-9_-]/g, "");
+
   const filePath = path.join(
     os.tmpdir(),
     `mitfloww-watermark-${safeJobId}-${Date.now()}.png`,
   );
 
-  await fs.promises.writeFile(filePath, overlay);
+  await sharp(svg, {
+    limitInputPixels: false,
+  })
+    .png()
+    .toFile(filePath);
 
   return filePath;
 }

@@ -499,27 +499,72 @@ export async function handleJob(
     }
   };
 
-  const lockResult = await connection.set(
-    lockKey,
-    WORKER_ID,
-    "PX",
-    LOCK_TTL_MS,
-    "NX",
+  const lockOwner = `${WORKER_ID}:${Date.now()}`;
+
+  let lockResult = await connection.set(
+      lockKey,
+      lockOwner,
+      "PX",
+      LOCK_TTL_MS,
+      "NX",
   );
   if (lockResult !== "OK") {
-    //temp loggin instance
-    const existingOwner = await connection.get(lockKey);
-    const existingTtl = await connection.pttl(lockKey);
+      const existingOwner = await connection.get(lockKey);
+      const existingTtl = await connection.pttl(lockKey);
 
-    logger.info("Lock inspection", {
-      jobId: job.fileId,
-      lockKey,
-      existingOwner,
-      existingTtl,
-      currentWorker: WORKER_ID,
-    });
-    logger.info("Skipping duplicate execution", { jobId: job.fileId });
-    return;
+      logger.info("Lock inspection", {
+          jobId: job.fileId,
+          lockKey,
+          existingOwner,
+          existingTtl,
+          currentWorker: WORKER_ID,
+      });
+
+      const forceTakeover =
+          process.env.FORCE_STALE_JOB_LOCK === "true";
+
+      if (forceTakeover && existingOwner) {
+          const parts = existingOwner.split(":");
+          const startedAt = Number(parts[parts.length - 1]);
+
+          const maxAge = Number(
+              process.env.FORCE_STALE_JOB_LOCK_AFTER_MS || 300000,
+          );
+
+          if (
+              Number.isFinite(startedAt) &&
+              Date.now() - startedAt > maxAge
+          ) {
+              logger.warn("Removing stale lock", {
+                  jobId: job.fileId,
+                  ageMs: Date.now() - startedAt,
+              });
+
+              await connection.del(lockKey);
+
+              lockResult = await connection.set(
+                  lockKey,
+                  lockOwner,
+                  "PX",
+                  LOCK_TTL_MS,
+                  "NX",
+              );
+
+              if (lockResult === "OK") {
+                  logger.warn("Recovered stale job lock", {
+                      jobId: job.fileId,
+                  });
+              }
+          }
+      }
+
+      if (lockResult !== "OK") {
+          logger.info("Skipping duplicate execution", {
+              jobId: job.fileId,
+          });
+
+          return;
+      }
   }
 
   try {
@@ -632,7 +677,15 @@ export async function handleJob(
     heartbeat = setInterval(async () => {
       try {
         const owner = await connection.get(lockKey);
-        if (owner !== WORKER_ID) return;
+
+        if (owner !== lockOwner) {
+          logger.warn("Heartbeat skipped because lock ownership changed", {
+            jobId: job.fileId,
+            expectedOwner: lockOwner,
+            actualOwner: owner,
+          });
+          return;
+        }
 
         await connection.pexpire(lockKey, LOCK_TTL_MS);
         if (job.fileVersionId) {
@@ -1283,8 +1336,15 @@ export async function handleJob(
 
     try {
       const owner = await connection.get(lockKey);
-      if (owner === WORKER_ID) {
+
+      if (owner === lockOwner) {
         await connection.del(lockKey);
+      } else {
+        logger.warn("Skipping lock deletion because ownership changed", {
+          jobId: job.fileId,
+          expectedOwner: lockOwner,
+          actualOwner: owner,
+        });
       }
     } catch (error) { 
       logger.error("Lock release error", { jobId: job.fileId, error });
