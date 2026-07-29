@@ -94,16 +94,17 @@ function getPatternSpacing(input: {
     return {
       xGap:
         density === 'dense'
-          ? baseSize * 1.9
+          ? baseSize * 3
           : density === 'light'
-            ? baseSize * 3.2
-            : baseSize * 2.55,
+            ? baseSize * 5
+            : baseSize * 4,
+
       yGap:
         density === 'dense'
-          ? baseSize * 1.25
+          ? baseSize * 2
           : density === 'light'
-            ? baseSize * 2.2
-            : baseSize * 1.75,
+            ? baseSize * 3.5
+            : baseSize * 2.8,
     };
   }
 
@@ -169,8 +170,7 @@ function createRepeatedLogoNodes(input: {
 }) {
   const nodes: string[] = [];
 
-  const backgroundWidth = input.logoWidth * 1.45;
-  const backgroundHeight = input.logoHeight * 1.55;
+  const stripHeight = input.logoHeight * 1.8;
 
   for (let y = input.startY; y <= input.endY; y += input.yGap) {
     const rowOffset =
@@ -178,6 +178,24 @@ function createRepeatedLogoNodes(input: {
         ? 0
         : input.xGap / 2;
 
+    /*
+     * One continuous translucent strip per row
+     */
+    nodes.push(`
+      <rect
+        x="${Math.round(input.startX)}"
+        y="${Math.round(y - stripHeight / 2)}"
+        width="${Math.round(input.endX - input.startX)}"
+        height="${Math.round(stripHeight)}"
+        rx="${Math.round(stripHeight / 2)}"
+        fill="#000000"
+        fill-opacity="0.22"
+      />
+    `);
+
+    /*
+     * Logos on top of the strip
+     */
     for (
       let x = input.startX - rowOffset;
       x <= input.endX;
@@ -186,25 +204,7 @@ function createRepeatedLogoNodes(input: {
       const imageX = Math.round(x - input.logoWidth / 2);
       const imageY = Math.round(y - input.logoHeight / 2);
 
-      const backgroundX = Math.round(
-        x - backgroundWidth / 2,
-      );
-
-      const backgroundY = Math.round(
-        y - backgroundHeight / 2,
-      );
-
       nodes.push(`
-        <rect
-          x="${backgroundX}"
-          y="${backgroundY}"
-          width="${Math.round(backgroundWidth)}"
-          height="${Math.round(backgroundHeight)}"
-          rx="${Math.round(backgroundHeight * 0.18)}"
-          fill="#000000"
-          fill-opacity="0.28"
-        />
-
         <image
           href="data:image/png;base64,${input.logoBase64}"
           x="${imageX}"
