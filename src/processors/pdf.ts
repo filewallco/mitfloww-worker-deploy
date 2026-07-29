@@ -127,7 +127,11 @@ async function applyPdfWatermark(
 
   const logoWatermarkEnabled = isLogoWatermarkEnabled();
 
-  // Cache embedded overlays by page size
+  /*
+  * Text watermark is the default.
+  * Logo watermark is used only when explicitly enabled AND
+  * the overlay can actually be generated.
+  */
   const overlayCache = new Map<string, PDFImage>();
 
   for (const page of pages) {
@@ -137,56 +141,100 @@ async function applyPdfWatermark(
 
     assertPageSize(pageWidth, pageHeight);
 
+    let logoApplied = false;
+
     if (logoWatermarkEnabled) {
-      const roundedWidth = Math.round(pageWidth);
-      const roundedHeight = Math.round(pageHeight);
+      try {
+        const roundedWidth = Math.round(pageWidth);
+        const roundedHeight = Math.round(pageHeight);
 
-      const cacheKey =
-        `${roundedWidth}:${roundedHeight}:${text}:${opacity}:light`;
+        const cacheKey =
+          `${roundedWidth}:${roundedHeight}:${text}:${opacity}:light`;
 
-      let overlayImage = overlayCache.get(cacheKey);
+        let overlayImage = overlayCache.get(cacheKey);
 
-      if (!overlayImage) {
-        const overlay = await createRepeatedWatermarkOverlay({
-          width: roundedWidth,
-          height: roundedHeight,
-          text,
-          opacity,
-          density: 'light',
-        });
+        if (!overlayImage) {
+          const overlay = await createRepeatedWatermarkOverlay({
+            width: roundedWidth,
+            height: roundedHeight,
+            text,
+            opacity,
+            density: "light",
+          });
 
-        overlayImage = await pdfDoc.embedPng(overlay);
-        overlayCache.set(cacheKey, overlayImage);
+          /*
+          * Only use the logo watermark if an overlay
+          * was actually produced.
+          */
+          if (overlay && overlay.length > 0) {
+            overlayImage = await pdfDoc.embedPng(overlay);
+            overlayCache.set(cacheKey, overlayImage);
+          }
+        }
+
+        if (overlayImage) {
+          page.drawImage(overlayImage, {
+            x: 0,
+            y: 0,
+            width: pageWidth,
+            height: pageHeight,
+          });
+
+          logoApplied = true;
+        }
+      } catch {
+        /*
+        * Fall back to text watermark.
+        * We never fail the job just because
+        * the logo watermark could not be generated.
+        */
+        logoApplied = false;
       }
-
-      page.drawImage(overlayImage, {
-        x: 0,
-        y: 0,
-        width: pageWidth,
-        height: pageHeight,
-      });
-
-      await yieldToEventLoop();
-      continue;
     }
 
-    const fontSize = fitTextFontSize({
-      text,
-      pageWidth,
-      pageHeight,
-    });
+    /*
+    * Default watermark implementation.
+    * Used whenever logo watermarking is disabled
+    * or unavailable.
+    */
+    if (!logoApplied) {
+      const fontSize = fitTextFontSize({
+        text,
+        pageWidth,
+        pageHeight,
+      });
 
-    const textWidth = font.widthOfTextAtSize(text, fontSize);
+      const textWidth = font.widthOfTextAtSize(text, fontSize);
 
-    page.drawText(text, {
-      x: pageWidth / 2 - textWidth / 2,
-      y: pageHeight / 2,
-      size: fontSize,
-      font,
-      color: rgb(0.15, 0.15, 0.15),
-      opacity,
-      rotate: degrees(-32),
-    });
+      /*
+      * Draw repeated diagonal watermarks similar
+      * to protected PDF viewers.
+      */
+      const spacingX = textWidth + fontSize * 2;
+      const spacingY = fontSize * 3.2;
+
+      for (
+        let y = -pageHeight;
+        y < pageHeight * 2;
+        y += spacingY
+      ) {
+        for (
+          let x = -pageWidth;
+          x < pageWidth * 2;
+          x += spacingX
+        ) {
+          page.drawText(text, {
+            x,
+            y,
+            size: fontSize,
+            font,
+            color: rgb(0.45, 0.45, 0.45),
+            opacity,
+            rotate: degrees(-35),
+          });
+        }
+      }
+    }
 
     await yieldToEventLoop();
   }
