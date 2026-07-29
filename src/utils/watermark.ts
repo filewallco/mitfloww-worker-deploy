@@ -165,6 +165,7 @@ function createRepeatedLogoNodes(input: {
   yGap: number;
   logoWidth: number;
   logoHeight: number;
+  logoOpacity: number;
 }) {
   const nodes: string[] = [];
 
@@ -194,7 +195,6 @@ function createRepeatedLogoNodes(input: {
       );
 
       nodes.push(`
-        <!-- translucent background -->
         <rect
           x="${backgroundX}"
           y="${backgroundY}"
@@ -202,16 +202,16 @@ function createRepeatedLogoNodes(input: {
           height="${Math.round(backgroundHeight)}"
           rx="${Math.round(backgroundHeight * 0.18)}"
           fill="#000000"
-          fill-opacity="0.18"
+          fill-opacity="0.28"
         />
 
-        <!-- white logo -->
         <image
           href="data:image/png;base64,${input.logoBase64}"
           x="${imageX}"
           y="${imageY}"
           width="${Math.round(input.logoWidth)}"
           height="${Math.round(input.logoHeight)}"
+          opacity="${input.logoOpacity}"
           preserveAspectRatio="xMidYMid meet"
         />
       `);
@@ -242,6 +242,12 @@ export function createRepeatedWatermarkSvg(options: WatermarkOverlayOptions) {
     options.opacity ?? Number(process.env.WATERMARK_OPACITY || 0.12),
     0.035,
     0.22,
+  );
+
+  const logoOpacity = clamp(
+    Number(process.env.WATERMARK_LOGO_OPACITY || 0.62),
+    0.15,
+    0.75,
   );
 
   const spread = Math.ceil(Math.sqrt(width * width + height * height));
@@ -281,6 +287,7 @@ export function createRepeatedWatermarkSvg(options: WatermarkOverlayOptions) {
       yGap,
       logoWidth,
       logoHeight,
+      logoOpacity,
     });
 
     return Buffer.from(`
@@ -293,7 +300,6 @@ export function createRepeatedWatermarkSvg(options: WatermarkOverlayOptions) {
         <rect width="100%" height="100%" fill="transparent"/>
         <g
           transform="rotate(${angle} ${width / 2} ${height / 2})"
-          opacity="${opacity}"
         >
           ${contentNodes}
         </g>
