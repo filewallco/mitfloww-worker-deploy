@@ -508,55 +508,21 @@ export async function handleJob(
       LOCK_TTL_MS,
       "NX",
   );
+  
   if (lockResult !== "OK") {
-      const existingOwner = await connection.get(lockKey);
-      const existingTtl = await connection.pttl(lockKey);
-
-      logger.info("Lock inspection", {
+      logger.warn("Force removing previous render lock", {
           jobId: job.fileId,
-          lockKey,
-          existingOwner,
-          existingTtl,
-          currentWorker: WORKER_ID,
       });
 
-      const forceTakeover =
-          process.env.FORCE_STALE_JOB_LOCK === "true";
+      await connection.del(lockKey);
 
-      if (forceTakeover && existingOwner) {
-          const parts = existingOwner.split(":");
-          const startedAt = Number(parts[parts.length - 1]);
-
-          const maxAge = Number(
-              process.env.FORCE_STALE_JOB_LOCK_AFTER_MS || 300000,
-          );
-
-          if (
-              Number.isFinite(startedAt) &&
-              Date.now() - startedAt > maxAge
-          ) {
-              logger.warn("Removing stale lock", {
-                  jobId: job.fileId,
-                  ageMs: Date.now() - startedAt,
-              });
-
-              await connection.del(lockKey);
-
-              lockResult = await connection.set(
-                  lockKey,
-                  lockOwner,
-                  "PX",
-                  LOCK_TTL_MS,
-                  "NX",
-              );
-
-              if (lockResult === "OK") {
-                  logger.warn("Recovered stale job lock", {
-                      jobId: job.fileId,
-                  });
-              }
-          }
-      }
+      lockResult = await connection.set(
+          lockKey,
+          lockOwner,
+          "PX",
+          LOCK_TTL_MS,
+          "NX",
+      );
 
       if (lockResult !== "OK") {
           logger.info("Skipping duplicate execution", {
