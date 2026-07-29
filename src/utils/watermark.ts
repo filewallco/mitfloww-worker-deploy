@@ -168,17 +168,44 @@ function createRepeatedLogoNodes(input: {
 }) {
   const nodes: string[] = [];
 
+  const backgroundWidth = input.logoWidth * 1.45;
+  const backgroundHeight = input.logoHeight * 1.55;
+
   for (let y = input.startY; y <= input.endY; y += input.yGap) {
     const rowOffset =
       Math.floor((y - input.startY) / input.yGap) % 2 === 0
         ? 0
         : input.xGap / 2;
 
-    for (let x = input.startX - rowOffset; x <= input.endX; x += input.xGap) {
+    for (
+      let x = input.startX - rowOffset;
+      x <= input.endX;
+      x += input.xGap
+    ) {
       const imageX = Math.round(x - input.logoWidth / 2);
       const imageY = Math.round(y - input.logoHeight / 2);
 
+      const backgroundX = Math.round(
+        x - backgroundWidth / 2,
+      );
+
+      const backgroundY = Math.round(
+        y - backgroundHeight / 2,
+      );
+
       nodes.push(`
+        <!-- translucent background -->
+        <rect
+          x="${backgroundX}"
+          y="${backgroundY}"
+          width="${Math.round(backgroundWidth)}"
+          height="${Math.round(backgroundHeight)}"
+          rx="${Math.round(backgroundHeight * 0.18)}"
+          fill="#000000"
+          fill-opacity="0.18"
+        />
+
+        <!-- white logo -->
         <image
           href="data:image/png;base64,${input.logoBase64}"
           x="${imageX}"

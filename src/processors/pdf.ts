@@ -228,9 +228,9 @@ async function applyPdfWatermark(
             y,
             size: fontSize,
             font,
-            color: rgb(0.45, 0.45, 0.45),
-            opacity,
-            rotate: degrees(-35),
+            color: rgb(0.55, 0.55, 0.55),
+            opacity: Math.min(opacity, 0.10),
+            rotate: degrees(-45),
           });
         }
       }
