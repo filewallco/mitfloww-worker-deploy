@@ -12,6 +12,7 @@ import './worker/fastWorker';
 import './worker/standardWorker';
 import './worker/heavyWorker';
 import './worker/imageWorker';
+import { startCallbackRetryWorker } from "./worker/callbackRetry";
 import { startPriorityScheduler } from './scheduler/priorityScheduler';
 import { reconcileResourceHolders } from './worker/resourceManager';
 
@@ -54,6 +55,9 @@ try {
 
   logger.info("Starting priority scheduler");
   startPriorityScheduler();
+
+  logger.info("Starting callback retry worker");
+  startCallbackRetryWorker();
 
   logger.info("Worker startup complete");
 } catch (err) {

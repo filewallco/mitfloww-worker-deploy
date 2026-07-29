@@ -68,6 +68,10 @@ export const REDIS_KEYS = {
   RESOURCE_UPLOAD_HOLDERS: 'resource:upload:holders',
   METRIC_DURATION: (fileType: string, sizeBucket: string) => `metrics:duration:${fileType}:${sizeBucket}`,
   DLQ: 'dead-letter-queue',
+
+  // for storing the job completion status to handle failed api call
+  PENDING_CALLBACK: (jobId: string) =>
+    `pending_callback:${jobId}`,
 };
 
 // MB size

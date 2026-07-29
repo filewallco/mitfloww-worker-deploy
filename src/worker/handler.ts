@@ -146,28 +146,43 @@ async function updateJobStage(
   await connection.expire(REDIS_KEYS.JOB_LOGS(jobId), 60 * 60 * 24);
 }
 
-async function notifyCallback(job: FileJob, payload: Record<string, unknown>) {
-  if (!job.callbackUrl) return;
+async function notifyCallback(job: FileJob, payload: Record<string, unknown>,) {
+    if (!job.callbackUrl) return false;
 
-  logger.info("Calling callback", {
-      callbackUrl: job.callbackUrl
-  });
+    try {
+        const response = await fetch(job.callbackUrl,{
+            method:"POST",
+            headers:{
+                "Content-Type":"application/json",
+                Authorization:
+                    `Bearer ${
+                        process.env.PROCESSING_CALLBACK_TOKEN
+                        || job.callbackToken
+                        || ""
+                    }`
+            },
+            body:JSON.stringify({
+                jobId:job.fileId,
+                fileId:payload.fileId ?? job.fileId,
+                fileVersionId:job.fileVersionId,
+                ...payload
+            })
+        });
 
-  await fetch(job.callbackUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.PROCESSING_CALLBACK_TOKEN || job.callbackToken || ""}`,
-    },
-    body: JSON.stringify({
-      jobId: job.fileId,
-      fileId: payload.fileId ?? job.fileId,
-      fileVersionId: job.fileVersionId,
-      ...payload,
-    }),
-  }).catch((error) => {
-    logger.error("Processing callback failed", { jobId: job.fileId, error });
-  });
+        if(!response.ok){
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        await connection.del(
+            REDIS_KEYS.PENDING_CALLBACK(job.fileId)
+        );
+
+        return true;
+    }
+    catch(error){
+        logger.error("Processing callback failed", {jobId:job.fileId, error});
+        return false;
+    }
 }
 
 async function materializeInputPath(
@@ -1013,11 +1028,18 @@ export async function handleJob(
       });
     }
 
-    await notifyCallback(job, {
-      status: "completed",
-      processed: processedResult,
-      log: logObject,
-    });
+    const callbackPayload = {
+        status: "completed",
+        processed: processedResult,
+        log: logObject,
+    };
+
+    await connection.set(
+        REDIS_KEYS.PENDING_CALLBACK(job.fileId),
+        JSON.stringify(callbackPayload)
+    );
+
+    await notifyCallback(job, callbackPayload);
   } catch (rawError) {
     if (rawError instanceof DelayedError) {
       throw rawError;
@@ -1046,11 +1068,19 @@ export async function handleJob(
             context,
             JOB_STATUS.FAILED,
           );
-          await notifyCallback(job, {
+
+          const callbackPayload = {
             status: "failed",
             errorCode: scheduleError.code,
             errorMessage: scheduleError.publicMessage,
-          });
+          };
+
+          await connection.set(
+              REDIS_KEYS.PENDING_CALLBACK(job.fileId),
+              JSON.stringify(callbackPayload)
+          );
+
+          await notifyCallback(job, callbackPayload);
           logger.error("Job failed with resource wait timeout", { jobId: job.fileId, error: scheduleError });
           throw new UnrecoverableError(scheduleError.publicMessage);
         }
@@ -1063,11 +1093,19 @@ export async function handleJob(
       jobStatus = JOB_STATUS.FAILED;
       clearQueuedFileVersionIndex = true;
       await updateFailedState(job, normalized, context, JOB_STATUS.FAILED);
-      await notifyCallback(job, {
+      
+      const callbackPayload = {
         status: "failed",
         errorCode: normalized.code,
         errorMessage: normalized.publicMessage,
-      });
+      };
+
+      await connection.set(
+          REDIS_KEYS.PENDING_CALLBACK(job.fileId),
+          JSON.stringify(callbackPayload)
+      );
+
+      await notifyCallback(job, callbackPayload);
       logger.error("Job failed with resource wait timeout", { jobId: job.fileId, error: normalized });
       throw new UnrecoverableError(normalized.publicMessage);
     }
@@ -1081,11 +1119,18 @@ export async function handleJob(
       jobStatus = JOB_STATUS.FAILED;
       clearQueuedFileVersionIndex = true;
       await updateFailedState(job, normalized, context, JOB_STATUS.FAILED);
-      await notifyCallback(job, {
+      const callbackPayload = {
         status: normalized instanceof CorruptInputError ? "corrupt" : "failed",
         errorCode: normalized.code,
         errorMessage: normalized.publicMessage,
-      });
+      };
+
+      await connection.set(
+          REDIS_KEYS.PENDING_CALLBACK(job.fileId),
+          JSON.stringify(callbackPayload)
+      );
+
+      await notifyCallback(job, callbackPayload);
       logger.error("Job failed with known unrecoverable error", { jobId: job.fileId, error: normalized });
       throw new UnrecoverableError(normalized.publicMessage);
     }
@@ -1101,11 +1146,18 @@ export async function handleJob(
     await updateFailedState(job, transientError, context, jobStatus);
 
     if (!shouldRetry) {
-      await notifyCallback(job, {
+      const callbackPayload = {
         status: "failed",
         errorCode: "processing_failed",
         errorMessage: toPublicErrorMessage(transientError.message),
-      });
+      };
+
+      await connection.set(
+          REDIS_KEYS.PENDING_CALLBACK(job.fileId),
+          JSON.stringify(callbackPayload)
+      );
+
+      await notifyCallback(job, callbackPayload);
     }
 
     logger.error("Job processing failed", { 
