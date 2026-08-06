@@ -96,10 +96,17 @@ function normalizeStoredAssetKey(key: string): string {
 
 function buildPublicAssetUrl(key: string): string {
   const normalizedKey = normalizeStoredAssetKey(key);
+  
+  if (process.env.STORAGE_PROVIDER === "local") {
+    // For local storage, the web client fetches via API or we return a placeholder.
+    // In dev it fetches from worker static.
+    return `http://localhost:4000/static/${encodeURI(normalizedKey)}`;
+  }
+
   const publicBaseUrl = process.env.R2_PUBLIC_BASE_URL?.replace(/\/+$/, "");
 
   if (config.mode !== "local" && !publicBaseUrl) {
-    throw new Error("R2_PUBLIC_BASE_URL is required in server mode.");
+    throw new Error("R2_PUBLIC_BASE_URL is required in server mode when using R2.");
   }
 
   return config.mode === "local"

@@ -421,7 +421,7 @@ export async function recoverStuckJobs() {
         continue;
       }
 
-      const hasR2Source = Boolean(meta.sourceBucket && meta.sourceKey);
+      const hasStorageSource = Boolean(meta.sourceBucket && meta.sourceKey);
       const hasAllowedRemoteUrl =
         Boolean(meta.inputUrl) &&
         !meta.inputUrl.startsWith("file://") &&
@@ -431,8 +431,8 @@ export async function recoverStuckJobs() {
         meta.inputUrl.startsWith("file://") &&
         process.env.ALLOW_LOCAL_FILE_INPUTS === "true";
 
-      if (!hasR2Source && !hasAllowedRemoteUrl && !hasAllowedLocalUrl) {
-        console.warn(`Skipping stuck job recovery without R2 source: ${jobId}`);
+      if (!hasStorageSource && !hasAllowedRemoteUrl && !hasAllowedLocalUrl) {
+        console.warn(`Skipping stuck job recovery without storage source: ${jobId}`);
         continue;
       }
 

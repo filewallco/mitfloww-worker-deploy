@@ -46,7 +46,7 @@ function getClient() {
   return client;
 }
 
-function contentTypeFromKey(key: string) {
+export function contentTypeFromKey(key: string) {
   const ext = path.extname(key).toLowerCase();
   if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
   if (ext === '.png') return 'image/png';

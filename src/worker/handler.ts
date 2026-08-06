@@ -26,12 +26,15 @@ import {
 } from "../utils/media";
 import {
   download,
-  downloadFromR2,
-  headR2Object,
   upload,
-  uploadJsonToR2,
-  uploadToR2,
+  contentTypeFromKey
 } from "../utils/r2";
+import {
+  downloadObject,
+  headObject,
+  uploadJsonObject,
+  uploadObject,
+} from "../utils/storage";
 import { recordProcessingDuration } from "../utils/eta";
 import { buildTraceableWatermarkText } from "../utils/watermark";
 import {
@@ -221,7 +224,7 @@ async function materializeInputPath(
 
 async function resolveSourceMetadata(job: FileJob): Promise<SourceMetadata> {
   if (job.sourceBucket && job.sourceKey) {
-    const head = await headR2Object({
+    const head = await headObject({
       bucket: job.sourceBucket,
       key: job.sourceKey,
     });
@@ -570,7 +573,7 @@ export async function handleJob(
 
     const source = await resolveSourceMetadata(job);
     
-    logger.info("R2 HEAD success", {
+    logger.info("Storage HEAD success", {
       expectedBytes: source.expectedBytes,
     });
 
@@ -720,7 +723,7 @@ export async function handleJob(
         key: job.sourceKey,
       });
 
-      await downloadFromR2({
+      await downloadObject({
         bucket: job.sourceBucket,
         key: job.sourceKey,
         dest: rawInputPath,
@@ -981,11 +984,12 @@ export async function handleJob(
     
     logger.info("Uploading output");
 
-    const result = job.outputBucket
-      ? await uploadToR2({
+        const result = job.outputBucket
+      ? await uploadObject({
           bucket: job.outputBucket,
           key: job.outputKey,
           filePath: outputPath,
+          contentType: contentTypeFromKey(job.outputKey),
           holderId: `${job.fileId}:upload`,
           onProgress: onUploadProgress,
         })
@@ -1047,7 +1051,7 @@ export async function handleJob(
         }
       });
 
-      logObject = await uploadJsonToR2({
+      logObject = await uploadJsonObject({
         bucket: job.outputBucket,
         key: job.logKey,
         payload: {
