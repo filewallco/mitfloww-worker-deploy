@@ -4,7 +4,7 @@ import { recoverStuckJobs } from './server/admin';
 import { startAdminServer } from './server/http';
 import { startWS } from './server/ws';
 import { getFreeDiskSpace } from './utils/disk';
-import { cleanupTempDir } from './utils/cleanup';
+import { cleanupTempDir, runPeriodicMaintenance } from './utils/cleanup';
 import { logger } from './utils/logger';
 
 // Import workers to initialize queues
@@ -56,10 +56,16 @@ try {
   logger.info("Starting priority scheduler");
   startPriorityScheduler();
 
-  logger.info("Starting callback retry worker");
   startCallbackRetryWorker();
 
   logger.info("Worker startup complete");
+
+  reconcileResourceHolders().catch((err) =>
+    logger.error('reconcileResourceHolders on startup failed', { error: err }),
+  );
+  recoverStuckJobs().catch((err) =>
+    logger.error('recoverStuckJobs on startup failed', { error: err }),
+  );
 } catch (err) {
   logger.fatal("Startup failed", { error: err });
   process.exit(1);
@@ -99,3 +105,21 @@ process.on('unhandledRejection', (reason) => {
     logger.fatal('unhandledRejection', { reason, sessionId: process.env.SESSION_ID });
   } catch {}
 });
+
+
+/**
+ * Periodic maintenance: runs every 12 hours (purging 72h / 3-day old orphaned data)
+ */
+setInterval(async () => {
+  try {
+    await runPeriodicMaintenance();
+  } catch (err) {
+    logger.error('Periodic maintenance scheduled run failed', { error: err });
+  }
+}, 12 * 60 * 60 * 1000);
+
+setTimeout(() => {
+  runPeriodicMaintenance().catch((err) =>
+    logger.error('Startup periodic maintenance error', { error: err }),
+  );
+}, 60_000);

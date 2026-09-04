@@ -62,7 +62,8 @@ import {
 } from "./resourceManager";
 
 const SAFE_JOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const LOCK_TTL_MS = 60 * 60 * 1000;
+const LOCK_TTL_MS = 180_000; // 3 minutes lease
+const HEARTBEAT_INTERVAL_MS = 30_000; // 30 seconds
 const FILE_VERSION_KEY_TTL_MS = 24 * 60 * 60 * 1000;
 const LOCAL_PROTOCOL_ARGS = ["-safe", "1", "-protocol_whitelist", "file,pipe"];
 const WORKER_ID = `${process.pid}-${Date.now()}`;
@@ -149,7 +150,28 @@ async function updateJobStage(
   await connection.expire(REDIS_KEYS.JOB_LOGS(jobId), 60 * 60 * 24);
 }
 
-async function notifyCallback(job: FileJob, payload: Record<string, unknown>,) {
+
+export const activeJobAbortControllers = new Map<string, AbortController>();
+
+export function cancelActiveJob(jobId: string): boolean {
+  const controller = activeJobAbortControllers.get(jobId);
+  if (controller) {
+    logger.info("Aborting active job process", { jobId });
+    controller.abort();
+    return true;
+  }
+  return false;
+}
+
+export async function notifyCallback(
+  job: {
+    fileId: string;
+    fileVersionId?: string;
+    callbackUrl?: string;
+    callbackToken?: string;
+  },
+  payload: Record<string, unknown>,
+) {
     if (!job.callbackUrl) return false;
 
     try {
@@ -436,6 +458,15 @@ export async function handleJob(
   const jobKey = REDIS_KEYS.JOB(job.fileId);
   const context: HandleContext = { bullJob, token, startTime, jobKey };
 
+  const initialStatus = await connection.hget(jobKey, "status");
+  if (initialStatus === JOB_STATUS.CANCELLED) {
+    logger.info("Job was cancelled before pickup, skipping execution", { jobId: job.fileId });
+    return;
+  }
+
+  const abortController = new AbortController();
+  activeJobAbortControllers.set(job.fileId, abortController);
+
   logger.info("Job started", { jobId: job.fileId, fileType: job.fileType, size: job.size });
   const userId = job.userId || "local-user";
   const cpuLane: CpuLane = (() => {
@@ -505,35 +536,42 @@ export async function handleJob(
   const lockOwner = `${WORKER_ID}:${Date.now()}`;
 
   let lockResult = await connection.set(
-      lockKey,
-      lockOwner,
-      "PX",
-      LOCK_TTL_MS,
-      "NX",
+    lockKey,
+    lockOwner,
+    "PX",
+    LOCK_TTL_MS,
+    "NX",
   );
-  
+
   if (lockResult !== "OK") {
-      logger.warn("Force removing previous render lock", {
-          jobId: job.fileId,
+    const [existingOwner, meta] = await Promise.all([
+      connection.get(lockKey),
+      connection.hgetall(jobKey),
+    ]);
+
+    const heartbeatAt = Number(meta.heartbeatAt || meta.updatedAt || 0);
+    const stuckThresholdMs = Number(
+      process.env.STUCK_JOB_THRESHOLD_MS || 180_000,
+    );
+    const isHeartbeatFresh =
+      heartbeatAt > 0 && Date.now() - heartbeatAt < stuckThresholdMs;
+
+    if (existingOwner && existingOwner !== lockOwner && isHeartbeatFresh) {
+      logger.warn("Job already being processed by active worker with fresh heartbeat", {
+        jobId: job.fileId,
+        existingOwner,
+        heartbeatAt,
       });
+      return;
+    }
 
-      await connection.del(lockKey);
+    logger.warn("Claiming lock from stale or unheartbeated predecessor", {
+      jobId: job.fileId,
+      existingOwner,
+      heartbeatAt,
+    });
 
-      lockResult = await connection.set(
-          lockKey,
-          lockOwner,
-          "PX",
-          LOCK_TTL_MS,
-          "NX",
-      );
-
-      if (lockResult !== "OK") {
-          logger.info("Skipping duplicate execution", {
-              jobId: job.fileId,
-          });
-
-          return;
-      }
+    await connection.set(lockKey, lockOwner, "PX", LOCK_TTL_MS);
   }
 
   try {
@@ -676,7 +714,7 @@ export async function handleJob(
       } catch (error) {
         logger.error("Heartbeat error", { jobId: job.fileId, error });
       }
-    }, 60_000);
+    }, HEARTBEAT_INTERVAL_MS);
 
     await updateJobStage(
       job.fileId,
@@ -1259,7 +1297,7 @@ export async function handleJob(
       }
     }
 
-    if (jobStatus === JOB_STATUS.COMPLETED) {
+    if (jobStatus === JOB_STATUS.COMPLETED || (jobStatus as string) === JOB_STATUS.CANCELLED) {
       try {
         await fs.promises.rm(tempDir, { recursive: true, force: true });
         await connection.hdel(jobKey, "tempDir", "tempCleanupEligibleAt");

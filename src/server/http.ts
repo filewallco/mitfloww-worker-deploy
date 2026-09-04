@@ -11,6 +11,9 @@ import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
 import { imageQueue, largeQueue, mediumQueue, smallQueue } from '../queue/queues';
 import { config } from '../config';
 import { isAdminRequestAuthorized } from '../security/auth';
+import { cancelActiveJob } from '../worker/handler';
+import { releaseDisk, releaseUserSlot } from '../worker/resourceManager';
+import { logger } from '../utils/logger';
 
 const STATIC_ROOT = path.resolve(process.cwd(), 'outputs');
 const STATIC_CONTENT_TYPES: Record<string, string> = {
@@ -592,12 +595,16 @@ export function startAdminServer() {
     if (req.url?.startsWith('/job/cancel/')) {
       const id = req.url.split('/').pop();
       if (!id || !SAFE_JOB_ID.test(id)) {
-        res.writeHead(400);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid job id' }));
         return;
       }
       const meta = await connection.hgetall(`job:${id}`);
 
+      // 1. Abort active processing task if running
+      cancelActiveJob(id);
+
+      // 2. Remove job from BullMQ queue so only this job is removed
       const job =
         await imageQueue.getJob(id!) ||
         await smallQueue.getJob(id!) ||
@@ -605,14 +612,22 @@ export function startAdminServer() {
         await largeQueue.getJob(id!);
 
       if (job) {
-        await job.remove();
+        try {
+          await job.remove();
+        } catch (err) {
+          logger.warn('Failed to remove job from BullMQ on cancel', { jobId: id, error: err });
+        }
       }
 
+      // 3. Mark Redis job as cancelled
       await connection.hset(`job:${id}`, {
         status: JOB_STATUS.CANCELLED,
         stage: JOB_STAGE.CANCELLED,
+        cancelledAt: Date.now(),
+        updatedAt: Date.now(),
       });
 
+      // 4. Release file version keys
       if (meta.fileVersionId) {
         const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(meta.fileVersionId);
         const activeKey = REDIS_KEYS.ACTIVE_FILE_VERSION(meta.fileVersionId);
@@ -629,8 +644,22 @@ export function startAdminServer() {
         }
       }
 
-      res.writeHead(200);
-      res.end(JSON.stringify({ success: true }));
+      // 5. Release worker lock, user slot, and disk reservation if held
+      await connection.del(REDIS_KEYS.LOCK(id));
+      if (meta.userId) {
+        await releaseUserSlot(meta.userId, id).catch(() => {});
+      }
+      await releaseDisk(id).catch(() => {});
+
+      // 6. Clean up temp folder if it exists
+      const tempDir = meta.tempDir || path.join(config.tempDir, id);
+      try {
+        await fs.promises.rm(tempDir, { recursive: true, force: true });
+        await connection.hdel(`job:${id}`, 'tempDir', 'tempCleanupEligibleAt');
+      } catch {}
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, jobId: id, status: 'cancelled' }));
       return;
     }
 

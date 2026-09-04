@@ -8,7 +8,7 @@ import { config } from '../config';
  */
 export function startWS() {
   const wss = new WebSocketServer({
-    port: 4001,
+    port: process.env.WS_PORT ? Number(process.env.WS_PORT) : 4002,
     verifyClient: ({ req }, done) => {
       done(isWebSocketRequestAuthorized(req), 401, 'Unauthorized');
     },
@@ -24,5 +24,5 @@ export function startWS() {
     });
   }, config.wsSnapshotIntervalMs);
 
-  console.log('WebSocket running on ws://localhost:4001');
+  console.log('WebSocket running on ws://localhost:4002');
 }

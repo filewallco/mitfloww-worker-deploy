@@ -6,6 +6,7 @@ import { FILE_TYPE, JOB_STAGE, JOB_STATUS, QUEUE_NAME, REDIS_KEYS } from "../con
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { getJobReservation, reconcileResourceHolders, releaseDisk } from '../worker/resourceManager';
+import { notifyCallback } from '../worker/handler';
 
 async function getBullState(jobId: string): Promise<string | null> {
   const jobInstance =
@@ -261,27 +262,34 @@ export async function recoverStuckJobs() {
 
   const now = Date.now();
   const STUCK_THRESHOLD = Number(
-    process.env.STUCK_JOB_THRESHOLD_MS || 30 * 60 * 1000,
+    process.env.STUCK_JOB_THRESHOLD_MS || 180 * 1000,
   );
-  const RECOVERABLE_STAGES = new Set<string>([
-    JOB_STAGE.PROCESSING,
-    JOB_STAGE.UPLOADING,
-    JOB_STAGE.DOWNLOADING,
-    JOB_STAGE.VALIDATING,
-    JOB_STAGE.RESERVED,
-    JOB_STAGE.WAITING_FOR_DISK,
-    JOB_STAGE.WAITING_FOR_CPU,
-    JOB_STAGE.WAITING_FOR_USER_SLOT,
-    JOB_STAGE.DELAYED,
-    JOB_STAGE.STARTING,
-    JOB_STAGE.STUCK_RECOVERY,
-  ]);
 
   for (const key of keys) {
     const jobId = key.replace("job:", "");
 
     try {
       const meta = await connection.hgetall(key);
+      if (!meta || Object.keys(meta).length === 0) {
+        continue;
+      }
+
+      if (
+        meta.status === JOB_STATUS.COMPLETED ||
+        meta.status === JOB_STATUS.FAILED ||
+        meta.status === JOB_STATUS.CANCELLED
+      ) {
+        continue;
+      }
+
+      if (
+        meta.status !== JOB_STATUS.PROCESSING &&
+        meta.status !== JOB_STATUS.RETRYING &&
+        meta.status !== JOB_STATUS.UPLOADING &&
+        meta.status !== JOB_STATUS.QUEUED
+      ) {
+        continue;
+      }
 
       const jobInstance =
         (await imageQueue.getJob(jobId)) ||
@@ -291,41 +299,21 @@ export async function recoverStuckJobs() {
 
       const state = jobInstance ? await jobInstance.getState() : null;
       const lockOwner = await connection.get(REDIS_KEYS.LOCK(jobId));
-      const heartbeatAt = Number(meta.heartbeatAt || meta.updatedAt || 0);
+      const heartbeatAt = Number(meta.heartbeatAt || meta.updatedAt || meta.startedAt || meta.queuedAt || 0);
       const heartbeatFresh = heartbeatAt > 0 && now - heartbeatAt < STUCK_THRESHOLD;
-      const reservationBytes = await getJobReservation(jobId);
-      const hasReservation = reservationBytes > 0;
 
-      // Never recover live Bull active jobs.
-      if (state === "active") {
-        continue;
-      }
-
-      // Never recover if lock + heartbeat are still fresh.
-      if (lockOwner && heartbeatFresh) {
-        continue;
-      }
-
-      // Never recover if reservation + heartbeat are still fresh.
-      if (hasReservation && heartbeatFresh) {
+      if (heartbeatFresh && (state === "active" || lockOwner)) {
         continue;
       }
 
       if (
-        state === "waiting" ||
-        state === "delayed" ||
-        state === "prioritized" ||
-        state === "completed" ||
-        state === "failed"
+        meta.status === JOB_STATUS.QUEUED &&
+        (state === "waiting" || state === "delayed" || state === "prioritized")
       ) {
         continue;
       }
 
-      if (meta.status !== JOB_STATUS.PROCESSING && meta.status !== JOB_STATUS.RETRYING) {
-        continue;
-      }
-
-      if (meta.stage && !RECOVERABLE_STAGES.has(meta.stage)) {
+      if (state === "completed") {
         continue;
       }
 
@@ -333,15 +321,35 @@ export async function recoverStuckJobs() {
         continue;
       }
 
-      const manualRetryCount = Number(meta.manualRetryCount || 0);
-      if (manualRetryCount >= config.processing.maxManualRetries) {
+      const manualRetryCount = Number(meta.manualRetryCount || meta.retryCount || 0);
+      const attemptsMade = Number(jobInstance?.attemptsMade ?? meta.attemptsMade ?? manualRetryCount);
+      const maxAttempts = Number(config.processing.maxManualRetries || 3);
+
+      if (manualRetryCount >= maxAttempts || attemptsMade >= maxAttempts) {
+        logger.warn('Stuck job retries exhausted, marking as failed', {
+          jobId,
+          manualRetryCount,
+          attemptsMade,
+          maxAttempts,
+        });
+
         await connection.hset(key, {
           status: JOB_STATUS.FAILED,
           stage: JOB_STAGE.FAILED,
-          error: 'Stuck recovery retries exhausted',
+          error: 'Processing failed: worker stopped responding or retries exhausted',
           errorCode: 'stuck_recovery_exhausted',
+          failedAt: now,
           updatedAt: now,
         });
+
+        if (jobInstance) {
+          try {
+            await jobInstance.remove();
+          } catch {}
+        }
+
+        await releaseDisk(jobId).catch(() => {});
+        await connection.del(REDIS_KEYS.LOCK(jobId)).catch(() => {});
 
         if (meta.fileVersionId) {
           const queuedKey = REDIS_KEYS.QUEUED_FILE_VERSION(meta.fileVersionId);
@@ -357,6 +365,27 @@ export async function recoverStuckJobs() {
             await connection.del(activeKey);
           }
         }
+
+        if (meta.callbackUrl) {
+          const callbackPayload = {
+            status: "failed",
+            errorCode: "stuck_recovery_exhausted",
+            errorMessage: "Processing failed: worker stopped responding or retries exhausted.",
+          };
+          await connection.set(
+            REDIS_KEYS.PENDING_CALLBACK(jobId),
+            JSON.stringify(callbackPayload),
+          );
+          await notifyCallback(
+            {
+              fileId: jobId,
+              fileVersionId: meta.fileVersionId,
+              callbackUrl: meta.callbackUrl,
+              callbackToken: meta.callbackToken,
+            },
+            callbackPayload,
+          );
+        }
         continue;
       }
 
@@ -371,9 +400,15 @@ export async function recoverStuckJobs() {
         continue;
       }
 
-      if (!lockOwner && hasReservation) {
-        await releaseDisk(jobId);
-      }
+      logger.info('Recovering stuck job for retry', {
+        jobId,
+        manualRetryCount,
+        attemptsMade,
+        state,
+      });
+
+      await releaseDisk(jobId).catch(() => {});
+      await connection.del(REDIS_KEYS.LOCK(jobId)).catch(() => {});
 
       await connection.hset(key, {
         status: JOB_STATUS.RETRYING,
@@ -386,9 +421,7 @@ export async function recoverStuckJobs() {
       if (jobInstance) {
         try {
           await jobInstance.remove();
-        } catch {
-          continue;
-        }
+        } catch {}
       }
 
       const fileType =

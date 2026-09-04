@@ -160,3 +160,79 @@ export async function cleanupTempDir() {
     }
   }
 }
+
+
+export async function runPeriodicMaintenance(
+  retentionMs: number = Number(process.env.MAINTENANCE_RETENTION_MS || 72 * 60 * 60 * 1000)
+) {
+  const now = Date.now();
+  logger.info('Starting periodic maintenance', { retentionMs, now });
+
+  // 1. Clean genuinely orphaned/old temp directories older than retentionMs (3 days)
+  const dir = config.tempDir;
+  if (fs.existsSync(dir)) {
+    try {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const fullPath = path.join(dir, entry.name);
+        const stat = await fs.promises.stat(fullPath).catch(() => null);
+        if (!stat) continue;
+
+        const ageMs = now - stat.mtimeMs;
+        if (ageMs < retentionMs) continue; // Only touch folders older than retention period
+
+        const decision = await decideFolderCleanup(entry.name, ageMs, now);
+        if (decision.shouldDelete) {
+          await fs.promises.rm(fullPath, { recursive: true, force: true }).catch(() => {});
+          logger.info('Periodic maintenance deleted orphaned temp folder', {
+            jobId: entry.name,
+            path: fullPath,
+            ageHours: Math.round(ageMs / 3600000),
+            reason: decision.reason,
+          });
+        }
+      }
+    } catch (err) {
+      logger.error('Periodic maintenance temp dir scan failed', { error: err });
+    }
+  }
+
+  // 2. Clean BullMQ completed and failed job history older than retention period
+  const queues = [imageQueue, smallQueue, mediumQueue, largeQueue];
+  for (const queue of queues) {
+    try {
+      await queue.clean(retentionMs, 1000, 'completed');
+      await queue.clean(retentionMs, 1000, 'failed');
+    } catch (err) {
+      logger.warn('Periodic maintenance BullMQ queue clean error', { queue: queue.name, error: err });
+    }
+  }
+
+  // 3. Clean stale terminal Redis job hashes older than retention period
+  try {
+    const keys = await connection.keys('job:*');
+    for (const key of keys) {
+      if (key.includes(':logs') || key.includes(':preview')) continue;
+      const meta = await connection.hgetall(key);
+      const status = meta?.status;
+      if (status === JOB_STATUS.COMPLETED || status === JOB_STATUS.FAILED || status === JOB_STATUS.CANCELLED) {
+        const timestamp = Number(meta.cancelledAt || meta.completedAt || meta.failedAt || meta.updatedAt || 0);
+        if (timestamp > 0 && now - timestamp >= retentionMs) {
+          const jobId = key.replace(/^job:/, '');
+          const lockExists = await connection.exists(REDIS_KEYS.LOCK(jobId));
+          if (!lockExists) {
+            await connection.del(key);
+            await connection.del(REDIS_KEYS.JOB_LOGS(jobId));
+            await connection.del(REDIS_KEYS.PREVIEW(jobId));
+            logger.info('Periodic maintenance purged stale terminal job Redis hash', { key, status });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn('Periodic maintenance Redis hash scan failed', { error: err });
+  }
+
+  logger.info('Periodic maintenance completed');
+}

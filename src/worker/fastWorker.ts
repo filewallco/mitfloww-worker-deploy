@@ -1,3 +1,4 @@
+import { onBullJobFailed } from './workerFailure';
 import { Worker } from 'bullmq';
 import { connection } from '../queue/connection';
 import { handleJob } from './handler';
@@ -21,7 +22,7 @@ const fastWorker = new Worker(
 );
 
 fastWorker.on('failed', (job, err) => {
-  logger.error('FAST worker job failed', { jobId: job?.id, error: err });
+  void onBullJobFailed('FAST', job, err);
 });
 
 fastWorker.on('error', (err) => {

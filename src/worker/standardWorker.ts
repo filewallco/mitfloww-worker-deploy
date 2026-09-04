@@ -1,3 +1,4 @@
+import { onBullJobFailed } from './workerFailure';
 import { Worker } from 'bullmq';
 import { connection } from '../queue/connection';
 import { handleJob } from './handler';
@@ -20,7 +21,7 @@ const standardWorker = new Worker(
 );
 
 standardWorker.on('failed', (job, err) => {
-  logger.error('STANDARD worker job failed', { jobId: job?.id, error: err });
+  void onBullJobFailed('STANDARD', job, err);
 });
 
 standardWorker.on('error', (err) => {

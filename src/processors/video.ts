@@ -156,6 +156,7 @@ export async function processVideo(
     height?: number | null;
     watermarkText?: string;
     isLargeFile?: boolean;
+    signal?: AbortSignal;
   },
   onProgress?: (progress: number) => void,
 ): Promise<void> {
@@ -234,7 +235,21 @@ export async function processVideo(
       output,
     ];
 
-    const ffmpeg = spawn(config.ffmpegPath, args);
+    if (options?.signal?.aborted) {
+      cleanup();
+      reject(new Error("Job cancelled"));
+      return;
+    }
+
+    const ffmpeg = spawn(config.ffmpegPath, args, { signal: options?.signal });
+
+    if (options?.signal) {
+      options.signal.addEventListener("abort", () => {
+        try {
+          ffmpeg.kill("SIGKILL");
+        } catch {}
+      }, { once: true });
+    }
 
     let lastProgressTime = Date.now();
     let progressBuffer = '';

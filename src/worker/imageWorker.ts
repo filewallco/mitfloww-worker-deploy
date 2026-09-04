@@ -1,3 +1,4 @@
+import { onBullJobFailed } from './workerFailure';
 import { Worker } from 'bullmq';
 import { connection } from '../queue/connection';
 import { handleJob } from './handler';
@@ -17,7 +18,7 @@ const imageWorker = new Worker(
 );
 
 imageWorker.on('failed', (job, err) => {
-  logger.error('IMAGE worker job failed', { jobId: job?.id, error: err });
+  void onBullJobFailed('IMAGE', job, err);
 });
 
 imageWorker.on('error', (err) => {
