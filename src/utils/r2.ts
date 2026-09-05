@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
 import {
+  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -178,6 +179,7 @@ export async function uploadToR2(input: {
   filePath: string;
   contentType?: string;
   holderId: string;
+  signal?: AbortSignal;
   onProgress?: (bytes: number, total: number) => void;
 }) {
   const stat = await fs.promises.stat(input.filePath);
@@ -239,6 +241,23 @@ export async function uploadToR2(input: {
       key: input.key,
     });
 
+    const abortListener = () => {
+      try {
+        upload.abort();
+      } catch {}
+      try {
+        fileStream.destroy();
+      } catch {}
+    };
+
+    if (input.signal) {
+      if (input.signal.aborted) {
+        abortListener();
+        throw new Error('Upload aborted: cancellation requested');
+      }
+      input.signal.addEventListener('abort', abortListener, { once: true });
+    }
+
     try {
       await upload.done();
     } catch (error) {
@@ -252,6 +271,7 @@ export async function uploadToR2(input: {
       throw error;
     }
 
+    if (input.signal) input.signal.removeEventListener('abort', abortListener);
     logger.info('R2 upload complete', {
       bucket: input.bucket,
       key: input.key,
@@ -275,6 +295,21 @@ export async function uploadToR2(input: {
     throw err;
   } finally {
     await releaseUploadSlot(holderId);
+  }
+}
+
+
+export async function deleteR2Object(bucket: string, key: string): Promise<void> {
+  try {
+    await getClient().send(
+      new DeleteObjectCommand({
+        Bucket: bucket,
+        Key: key,
+      }),
+    );
+    logger.info('Deleted R2 object', { bucket, key });
+  } catch (err) {
+    logger.warn('Failed to delete R2 object', { bucket, key, err });
   }
 }
 

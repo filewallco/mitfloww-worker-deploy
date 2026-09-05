@@ -1029,6 +1029,7 @@ export async function handleJob(
           filePath: outputPath,
           contentType: contentTypeFromKey(job.outputKey),
           holderId: `${job.fileId}:upload`,
+          signal: abortController.signal,
           onProgress: onUploadProgress,
         })
       : await upload(outputPath, job.outputKey, `${job.fileId}:upload`, onUploadProgress);
@@ -1115,6 +1116,18 @@ export async function handleJob(
   } catch (rawError) {
     if (rawError instanceof DelayedError) {
       throw rawError;
+    }
+
+    const currentStatus = await connection.hget(jobKey, 'status');
+    if (abortController.signal.aborted || currentStatus === JOB_STATUS.CANCELLED) {
+      logger.info('Job execution aborted due to cancellation', { jobId: job.fileId });
+      jobStatus = JOB_STATUS.CANCELLED;
+      clearQueuedFileVersionIndex = true;
+      try {
+        await fs.promises.rm(tempDir, { recursive: true, force: true });
+        await connection.hdel(jobKey, 'tempDir', 'tempCleanupEligibleAt');
+      } catch {}
+      return;
     }
 
     const normalized = normalizeError(rawError);
@@ -1241,6 +1254,7 @@ export async function handleJob(
 
     throw transientError;
   } finally {
+    activeJobAbortControllers.delete(job.fileId);
     if (heartbeat) clearInterval(heartbeat);
 
     if (userSlotHeld) {

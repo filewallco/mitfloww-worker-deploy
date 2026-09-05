@@ -5,6 +5,7 @@ import {
   downloadFromR2,
   uploadToR2,
   uploadJsonToR2,
+  deleteR2Object,
   contentTypeFromKey,
 } from "./r2";
 import { logger } from "./logger";
@@ -76,6 +77,7 @@ export async function uploadObject(input: {
   filePath: string;
   contentType?: string;
   holderId: string;
+  signal?: AbortSignal;
   onProgress?: (bytes: number, total: number) => void;
 }) {
   if (isLocal()) {
@@ -94,7 +96,10 @@ export async function uploadObject(input: {
     await tryAcquireUploadSlot(input.holderId);
 
     try {
-      const dest = getLocalPath(input.bucket, input.key);
+      if (input.signal?.aborted) {
+      throw new Error('Local upload file aborted: cancellation requested');
+    }
+    const dest = getLocalPath(input.bucket, input.key);
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.copyFile(input.filePath, dest);
       if (input.onProgress) {
@@ -131,4 +136,15 @@ export async function uploadJsonObject(input: {
     };
   }
   return uploadJsonToR2(input);
+}
+
+export async function deleteObject(bucket: string, key: string): Promise<void> {
+  if (isLocal()) {
+    try {
+      const dest = getLocalPath(bucket, key);
+      await fs.unlink(dest);
+    } catch {}
+    return;
+  }
+  return deleteR2Object(bucket, key);
 }
