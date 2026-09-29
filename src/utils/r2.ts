@@ -1,4 +1,5 @@
 import fs from 'fs';
+import https from 'https';
 import path from 'path';
 import { Readable } from 'stream';
 import {
@@ -15,6 +16,19 @@ import { tryAcquireUploadSlot, releaseUploadSlot } from '../worker/resourceManag
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 
 let client: S3Client | null = null;
+let httpsAgent: https.Agent | null = null;
+
+function getHttpsAgent() {
+  if (!httpsAgent) {
+    httpsAgent = new https.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 10_000,
+      maxSockets: 50,
+      timeout: 120_000,
+    });
+  }
+  return httpsAgent;
+}
 
 function getClient() {
   if (!client) {
@@ -39,7 +53,8 @@ function getClient() {
       maxAttempts: 5,
       requestHandler: new NodeHttpHandler({
         connectionTimeout: 30_000,
-        requestTimeout: 300_000,
+        requestTimeout: 120_000,
+        httpsAgent: getHttpsAgent(),
       }),
     });
   }
@@ -103,74 +118,195 @@ export async function downloadFromR2(input: {
 }) {
   logger.info('R2 download started', { bucket: input.bucket, key: input.key, expectedBytes: input.expectedBytes });
 
-  const result = await getClient().send(
-    new GetObjectCommand({
-      Bucket: input.bucket,
-      Key: input.key,
-    }),
-  );
-
-  const body = result.Body;
-  if (!(body instanceof Readable)) {
-    throw new Error('R2 object body is not readable.');
-  }
-
-  await fs.promises.mkdir(path.dirname(input.dest), { recursive: true });
-  const file = fs.createWriteStream(input.dest, { flags: 'w' });
-  const maxBytes = input.maxBytes ?? config.security.maxUploadBytes;
-  const expectedBytes =
+  let expectedBytes =
     Number.isFinite(input.expectedBytes) && (input.expectedBytes as number) > 0
       ? Number(input.expectedBytes)
       : null;
+
+  if (!expectedBytes) {
+    try {
+      const head = await headR2Object({ bucket: input.bucket, key: input.key });
+      if (head?.contentLength) {
+        expectedBytes = head.contentLength;
+      }
+    } catch (err) {
+      logger.warn('Could not determine object size via HEAD before download', { bucket: input.bucket, key: input.key, err });
+    }
+  }
+
+  const maxBytes = input.maxBytes ?? config.security.maxUploadBytes;
+  await fs.promises.mkdir(path.dirname(input.dest), { recursive: true });
+
   let writtenBytes = 0;
+  const maxDownloadAttempts = 8;
+  let attempt = 0;
+  let lastError: unknown = null;
 
-  await new Promise<void>((resolve, reject) => {
-    const fail = (error: unknown) => {
-      logger.error('R2 download stream error', { bucket: input.bucket, key: input.key, writtenBytes, error });
-      file.destroy();
-      reject(error);
-    };
+  // Clear any existing partial file before starting fresh
+  try {
+    await fs.promises.unlink(input.dest);
+  } catch {}
 
-    body.on('data', (chunk: Buffer) => {
-      writtenBytes += chunk.length;
+  while (attempt < maxDownloadAttempts) {
+    attempt++;
+    const isResuming = writtenBytes > 0;
+    const rangeHeader = isResuming ? `bytes=${writtenBytes}-` : undefined;
 
-      if (input.onProgress) {
-        input.onProgress(writtenBytes, expectedBytes ?? undefined);
+    if (isResuming) {
+      logger.info('Resuming R2 download using Range request', {
+        bucket: input.bucket,
+        key: input.key,
+        attempt,
+        startByte: writtenBytes,
+        expectedBytes,
+      });
+    }
+
+    try {
+      await new Promise<void>(async (resolve, reject) => {
+        let isDone = false;
+        let bodyStream: Readable | null = null;
+        let fileStream: fs.WriteStream | null = null;
+
+        const cleanup = (error?: unknown) => {
+          if (isDone) return;
+          isDone = true;
+          try {
+            bodyStream?.destroy();
+          } catch {}
+          try {
+            fileStream?.destroy();
+          } catch {}
+          if (error) {
+            reject(error);
+          } else {
+            resolve();
+          }
+        };
+
+        try {
+          const result = await getClient().send(
+            new GetObjectCommand({
+              Bucket: input.bucket,
+              Key: input.key,
+              Range: rangeHeader,
+            }),
+          );
+
+          bodyStream = result.Body as Readable;
+          if (!(bodyStream instanceof Readable)) {
+            cleanup(new Error('R2 object body is not readable.'));
+            return;
+          }
+
+          // When resuming, open with 'a' (append) to continue writing to disk
+          fileStream = fs.createWriteStream(input.dest, {
+            flags: isResuming ? 'a' : 'w',
+            highWaterMark: 4 * 1024 * 1024, // 4MB buffer prevents excessive backpressure stalls
+          });
+
+          bodyStream.on('data', (chunk: Buffer) => {
+            writtenBytes += chunk.length;
+
+            if (input.onProgress) {
+              input.onProgress(writtenBytes, expectedBytes ?? undefined);
+            }
+
+            if (writtenBytes > maxBytes) {
+              const err = new Error('Download exceeds maximum upload size');
+              logger.error('R2 download exceeded maxBytes', { bucket: input.bucket, key: input.key, writtenBytes, maxBytes });
+              cleanup(err);
+              return;
+            }
+
+            if (expectedBytes && writtenBytes > expectedBytes) {
+              const err = new Error('Download exceeds expected content length');
+              logger.error('R2 download exceeded expectedBytes', { bucket: input.bucket, key: input.key, writtenBytes, expectedBytes });
+              cleanup(err);
+              return;
+            }
+
+            if (!fileStream?.write(chunk)) {
+              bodyStream?.pause();
+              fileStream?.once('drain', () => bodyStream?.resume());
+            }
+          });
+
+          bodyStream.once('error', (err) => {
+            cleanup(err);
+          });
+
+          fileStream.once('error', (err) => {
+            cleanup(err);
+          });
+
+          bodyStream.once('end', () => {
+            if (!fileStream) {
+              cleanup();
+              return;
+            }
+            fileStream.end(() => {
+              cleanup();
+            });
+          });
+        } catch (fetchErr) {
+          cleanup(fetchErr);
+        }
+      });
+
+      // Verify on-disk size
+      const stats = await fs.promises.stat(input.dest);
+      writtenBytes = stats.size;
+
+      if (expectedBytes && writtenBytes < expectedBytes) {
+        throw new Error(`Incomplete download stream. expected=${expectedBytes} actual=${writtenBytes}`);
       }
 
-      if (writtenBytes > maxBytes) {
-        const err = new Error('Download exceeds maximum upload size');
-        logger.error('R2 download exceeded maxBytes', { bucket: input.bucket, key: input.key, writtenBytes, maxBytes });
-        body.destroy(err);
-        return;
-      }
-
-      if (expectedBytes && writtenBytes > expectedBytes) {
-        const err = new Error('Download exceeds expected content length');
-        logger.error('R2 download exceeded expectedBytes', { bucket: input.bucket, key: input.key, writtenBytes, expectedBytes });
-        body.destroy(err);
-        return;
-      }
-
-      if (!file.write(chunk)) {
-        body.pause();
-        file.once('drain', () => body.resume());
-      }
-    });
-
-    body.once('error', fail);
-    file.once('error', fail);
-    body.once('end', () => file.end(() => {
       logger.info('R2 download complete', { bucket: input.bucket, key: input.key, writtenBytes });
-      resolve();
-    }));
+      return;
+    } catch (err: any) {
+      lastError = err;
+      logger.warn('R2 download stream interrupted, will attempt range resumption', {
+        bucket: input.bucket,
+        key: input.key,
+        writtenBytes,
+        expectedBytes,
+        attempt,
+        maxDownloadAttempts,
+        error: err?.message || String(err),
+      });
+
+      // Synchronize writtenBytes with actual disk state
+      try {
+        const stats = await fs.promises.stat(input.dest);
+        writtenBytes = stats.size;
+      } catch {}
+
+      if (expectedBytes && writtenBytes >= expectedBytes) {
+        logger.info('R2 download complete despite stream interruption', { bucket: input.bucket, key: input.key, writtenBytes });
+        return;
+      }
+
+      if (attempt >= maxDownloadAttempts) {
+        break;
+      }
+
+      // Backoff before resuming: 1s, 2s, 4s, up to 8s
+      const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+    }
+  }
+
+  logger.error('R2 download failed after all resume attempts', {
+    bucket: input.bucket,
+    key: input.key,
+    expectedBytes,
+    writtenBytes,
+    attempts: attempt,
+    error: lastError,
   });
 
-  if (expectedBytes && writtenBytes !== expectedBytes) {
-    const msg = `Downloaded bytes mismatch. expected=${expectedBytes} actual=${writtenBytes}`;
-    logger.error('R2 download byte mismatch', { bucket: input.bucket, key: input.key, expectedBytes, writtenBytes });
-    throw new Error(msg);
-  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Download failed'));
 }
 
 export async function uploadToR2(input: {
