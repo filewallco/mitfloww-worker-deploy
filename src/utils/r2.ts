@@ -70,6 +70,12 @@ export function contentTypeFromKey(key: string) {
   if (ext === '.gif') return 'image/gif';
   if (ext === '.pdf') return 'application/pdf';
   if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.ogg') return 'audio/ogg';
+  if (ext === '.m4a') return 'audio/mp4';
+  if (ext === '.aac') return 'audio/aac';
+  if (ext === '.flac') return 'audio/flac';
   return 'application/octet-stream';
 }
 

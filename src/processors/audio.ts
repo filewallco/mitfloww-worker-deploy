@@ -10,6 +10,7 @@ type FfprobeStream = {
   codec_name?: string;
   channels?: number;
   sample_rate?: string;
+  duration?: string;
 };
 
 type FfprobeFormat = {
@@ -61,7 +62,7 @@ function runFfprobe(file: string): FfprobePayload {
     '-v',
     'error',
     '-show_entries',
-    'format=format_name,duration:stream=codec_type,codec_name,channels,sample_rate',
+    'format=format_name,duration:stream=codec_type,codec_name,channels,sample_rate,duration',
     '-of',
     'json',
     ...FFPROBE_PROTOCOL_ARGS,
@@ -74,7 +75,11 @@ function runFfprobe(file: string): FfprobePayload {
 export function inspectAudioInput(file: string): AudioProbe {
   const meta = runFfprobe(file);
   const audioStream = meta.streams?.find((s) => s.codec_type === 'audio');
-  const durationSec = meta.format?.duration ? Number(meta.format.duration) : null;
+  const durationSec = meta.format?.duration
+    ? Number(meta.format.duration)
+    : audioStream?.duration
+      ? Number(audioStream.duration)
+      : null;
   const durationMs =
     durationSec != null && Number.isFinite(durationSec)
       ? Math.max(0, Math.round(durationSec * 1000))

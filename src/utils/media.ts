@@ -46,9 +46,11 @@ const AUDIO_MIME_TYPES = new Set([
   'audio/wav',
   'audio/x-wav',
   'audio/wave',
+  'audio/vnd.wave',
   'audio/ogg',
   'application/ogg',
   'audio/x-m4a',
+  'audio/m4a',
   'audio/mp4',
   'audio/aac',
   'audio/flac',
@@ -66,28 +68,47 @@ const IMAGE_MIME_TYPES = new Set([
   'image/gif',
 ]);
 
-const SAFE_MEDIA_MIME_TO_EXTENSIONS = new Map<string, { fileType: FileJob['fileType']; exts: Set<string> }>([
-  ['image/jpeg', { fileType: FILE_TYPE.IMAGE, exts: new Set(['.jpg', '.jpeg']) }],
-  ['image/png', { fileType: FILE_TYPE.IMAGE, exts: new Set(['.png']) }],
-  ['image/webp', { fileType: FILE_TYPE.IMAGE, exts: new Set(['.webp']) }],
-  ['image/gif', { fileType: FILE_TYPE.IMAGE, exts: new Set(['.gif']) }],
-  ['video/mp4', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.mp4', '.m4v']) }],
-  ['video/quicktime', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.mov']) }],
-  ['video/webm', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.webm']) }],
-  ['video/x-matroska', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.mkv']) }],
-  ['video/vnd.avi', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.avi']) }],
-  ['video/x-msvideo', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.avi']) }],
-  ['video/x-ms-wmv', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.wmv']) }],
-  ['video/x-ms-asf', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.wmv']) }],
-  ['video/x-flv', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.flv']) }],
-  ['video/mpeg', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.mpg', '.mpeg', '.m2v']) }],
-  ['video/mp2t', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.ts', '.mts', '.m2ts']) }],
-  ['video/3gpp', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.3gp']) }],
-  ['video/ogg', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.ogv']) }],
-  ['application/ogg', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.ogv']) }],
-  ['application/mxf', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.mxf']) }],
-  ['application/pdf', { fileType: FILE_TYPE.PDF, exts: new Set(['.pdf']) }],
-  ['video/matroska', { fileType: FILE_TYPE.VIDEO, exts: new Set(['.mkv']) }]
+const SAFE_MEDIA_MIME_TO_EXTENSIONS = new Map<string, Array<{ fileType: FileJob['fileType']; exts: Set<string> }>>([
+  ['image/jpeg', [{ fileType: FILE_TYPE.IMAGE, exts: new Set(['.jpg', '.jpeg']) }]],
+  ['image/jpg', [{ fileType: FILE_TYPE.IMAGE, exts: new Set(['.jpg', '.jpeg']) }]],
+  ['image/png', [{ fileType: FILE_TYPE.IMAGE, exts: new Set(['.png']) }]],
+  ['image/webp', [{ fileType: FILE_TYPE.IMAGE, exts: new Set(['.webp']) }]],
+  ['image/gif', [{ fileType: FILE_TYPE.IMAGE, exts: new Set(['.gif']) }]],
+  ['video/mp4', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.mp4', '.m4v']) }]],
+  ['video/quicktime', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.mov']) }]],
+  ['video/webm', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.webm']) }]],
+  ['video/x-matroska', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.mkv']) }]],
+  ['video/vnd.avi', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.avi']) }]],
+  ['video/x-msvideo', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.avi']) }]],
+  ['video/x-ms-wmv', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.wmv']) }]],
+  ['video/x-ms-asf', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.wmv']) }]],
+  ['video/x-flv', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.flv']) }]],
+  ['video/mpeg', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.mpg', '.mpeg', '.m2v']) }]],
+  ['video/mp2t', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.ts', '.mts', '.m2ts']) }]],
+  ['video/3gpp', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.3gp']) }]],
+  ['video/ogg', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.ogv']) }]],
+  ['application/ogg', [
+    { fileType: FILE_TYPE.VIDEO, exts: new Set(['.ogv']) },
+    { fileType: FILE_TYPE.AUDIO, exts: new Set(['.ogg']) },
+  ]],
+  ['application/mxf', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.mxf']) }]],
+  ['application/pdf', [{ fileType: FILE_TYPE.PDF, exts: new Set(['.pdf']) }]],
+  ['video/matroska', [{ fileType: FILE_TYPE.VIDEO, exts: new Set(['.mkv']) }]],
+
+  // Audio mime types
+  ['audio/mpeg', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.mp3']) }]],
+  ['audio/mp3', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.mp3']) }]],
+  ['audio/wav', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.wav']) }]],
+  ['audio/x-wav', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.wav']) }]],
+  ['audio/wave', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.wav']) }]],
+  ['audio/vnd.wave', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.wav']) }]],
+  ['audio/ogg', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.ogg']) }]],
+  ['audio/x-m4a', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.m4a']) }]],
+  ['audio/m4a', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.m4a']) }]],
+  ['audio/mp4', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.m4a']) }]],
+  ['audio/aac', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.aac']) }]],
+  ['audio/flac', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.flac']) }]],
+  ['audio/x-flac', [{ fileType: FILE_TYPE.AUDIO, exts: new Set(['.flac']) }]],
 ]);
 
 const VIDEO_MIME_TYPES = new Set([
@@ -167,11 +188,17 @@ export function classifyFileType(
 ): FileJob['fileType'] {
   const ext = inferExtensionFromValue(extOrValue) ?? normalizeExtension(extOrValue);
   const normalizedMime = mime?.toLowerCase() ?? null;
-  const safeMime = normalizedMime
+  const entries = normalizedMime
     ? SAFE_MEDIA_MIME_TO_EXTENSIONS.get(normalizedMime)
     : null;
 
-  if (safeMime) return safeMime.fileType;
+  if (entries && entries.length > 0) {
+    if (ext) {
+      const matchByExt = entries.find((e) => e.exts.has(ext));
+      if (matchByExt) return matchByExt.fileType;
+    }
+    return entries[0].fileType;
+  }
 
   if (ext && IMAGE_EXTENSIONS.has(ext)) return FILE_TYPE.IMAGE;
   if (ext && VIDEO_EXTENSIONS.has(ext)) return FILE_TYPE.VIDEO;
@@ -197,12 +224,15 @@ export function assertAllowedMediaInput(
     throw new Error('Missing file extension');
   }
 
-  const allowedByMime = normalizedMime
-    ? SAFE_MEDIA_MIME_TO_EXTENSIONS.get(normalizedMime)
-    : null;
+  if (normalizedMime) {
+    const entries = SAFE_MEDIA_MIME_TO_EXTENSIONS.get(normalizedMime);
+    const allowed = entries?.some(
+      (e) => e.fileType === fileType && e.exts.has(ext),
+    );
 
-  if (normalizedMime && (!allowedByMime || allowedByMime.fileType !== fileType || !allowedByMime.exts.has(ext))) {
-    throw new Error(`MIME and extension mismatch: ${normalizedMime} ${ext}`);
+    if (!allowed) {
+      throw new Error(`MIME and extension mismatch: ${normalizedMime} ${ext}`);
+    }
   }
 
     if (fileType === FILE_TYPE.AUDIO) {
@@ -249,9 +279,12 @@ export function assertDetectedMediaMatchesDeclaration(
     throw new Error('Unable to detect trusted file signature');
   }
 
-  const allowed = SAFE_MEDIA_MIME_TO_EXTENSIONS.get(normalizedDetectedMime);
+  const entries = SAFE_MEDIA_MIME_TO_EXTENSIONS.get(normalizedDetectedMime);
+  const allowed = entries?.some(
+    (e) => e.fileType === fileType && e.exts.has(normalizedDetectedExt),
+  );
 
-  if (!allowed || allowed.fileType !== fileType || !allowed.exts.has(normalizedDetectedExt)) {
+  if (!allowed) {
     throw new Error(`Unsupported detected media type: ${normalizedDetectedMime} ${normalizedDetectedExt}`);
   }
 

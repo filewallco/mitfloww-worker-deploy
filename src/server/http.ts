@@ -25,6 +25,12 @@ const STATIC_CONTENT_TYPES: Record<string, string> = {
   '.webp': 'image/webp',
   '.gif': 'image/gif',
   '.pdf': 'application/pdf',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.m4a': 'audio/mp4',
+  '.aac': 'audio/aac',
+  '.flac': 'audio/flac',
   'video/x-matroska': 'video/x-matroska',
   'video/matroska': 'video/matroska',
 };
@@ -362,6 +368,9 @@ export function startAdminServer() {
         }));
         return;
       } catch (error) {
+        logger.error("Job enqueue failed via /jobs", {
+          error: error instanceof Error ? error.message : String(error),
+        });
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           error: error instanceof Error ? error.message : "Invalid request",
