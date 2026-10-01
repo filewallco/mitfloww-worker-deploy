@@ -35,7 +35,7 @@ export interface FileJob {
   extension?: string;
 
   // Determined file type category based on MIME type or extension, used for processing logic
-  fileType: "video" | "image" | "pdf" | "zip" | "other";
+  fileType: "audio" | "video" | "image" | "pdf" | "zip" | "other";
   // Size of the file in bytes, which is crucial for validating against size limits and managing resources
   size: number;
 

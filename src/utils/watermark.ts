@@ -403,3 +403,22 @@ export async function createRepeatedWatermarkOverlayFile(
 
   return filePath;
 }
+export function resolveWatermarkAudioPath(): string {
+  const configured = process.env.WATERMARK_AUDIO_PATH?.trim();
+
+  if (configured) {
+    return path.isAbsolute(configured)
+      ? configured
+      : path.resolve(process.cwd(), configured);
+  }
+
+  const defaultPath = path.resolve(process.cwd(), 'assets', 'watermark-audio.mp3');
+  if (fs.existsSync(defaultPath)) {
+    return defaultPath;
+  }
+  const fallbackPath = path.resolve(__dirname, '..', '..', 'assets', 'watermark-audio.mp3');
+  if (fs.existsSync(fallbackPath)) {
+    return fallbackPath;
+  }
+  return defaultPath;
+}

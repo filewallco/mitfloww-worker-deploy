@@ -9,6 +9,8 @@ import { connection } from "../queue/connection";
 import { classify } from "../queue/priority";
 import { processImage } from "../processors/image";
 import { processPdf } from "../processors/pdf";
+import { processAudio } from "../processors/audio";
+import { resolveWatermarkAudioPath } from "../utils/watermark";
 import {
   assertAllowedVideoProbe,
   inspectVideoInput,
@@ -470,7 +472,7 @@ export async function handleJob(
   logger.info("Job started", { jobId: job.fileId, fileType: job.fileType, size: job.size });
   const userId = job.userId || "local-user";
   const cpuLane: CpuLane = (() => {
-    if (job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF) {
+    if (job.fileType === FILE_TYPE.IMAGE || job.fileType === FILE_TYPE.PDF || job.fileType === FILE_TYPE.AUDIO) {
       return "image";
     }
 
@@ -909,6 +911,55 @@ export async function handleJob(
         processPdf(safeInput, outputBase, {
           watermarkText,
         }),
+      );
+      outputPath = result.outputPath;
+      job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);
+      await updateJobStage(
+        job.fileId,
+        JOB_STATUS.PROCESSING,
+        JOB_STAGE.PROCESSING,
+        {
+          progress: 100,
+          processingProgress: 100,
+          bullJob,
+        },
+      );
+    } else if (job.fileType === FILE_TYPE.AUDIO) {
+      let lastProgress = -1;
+      let lastProgressAt = 0;
+
+      const result = await withCpuSlot(() =>
+        processAudio(
+          safeInput,
+          outputBase,
+          {
+            jobId: job.fileId,
+            watermarkAudioPath: resolveWatermarkAudioPath(),
+          },
+          (progress) => {
+            const normalized = Math.max(0, Math.min(Math.round(progress), 100));
+            const now = Date.now();
+            if (normalized < 100) {
+              if (normalized <= lastProgress) return;
+              if (now - lastProgressAt < 750) return;
+            }
+            lastProgress = normalized;
+            lastProgressAt = now;
+
+            updateJobStage(
+              job.fileId,
+              JOB_STATUS.PROCESSING,
+              JOB_STAGE.PROCESSING,
+              {
+                progress: normalized,
+                processingProgress: normalized,
+                bullJob,
+              },
+            ).catch((err) => {
+              logger.warn("Audio progress update failed", { jobId: job.fileId, err });
+            });
+          },
+        ),
       );
       outputPath = result.outputPath;
       job.outputKey = job.outputKey.replace(/\.\w+$/, result.ext);

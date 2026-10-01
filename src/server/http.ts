@@ -71,6 +71,7 @@ function isWorkerRequestAuthorized(req: http.IncomingMessage) {
 }
 
 function classifyFileTypeFromMime(mimeType: string, extension: string) {
+  if (mimeType.startsWith("audio/") || [".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"].includes(extension.toLowerCase())) return FILE_TYPE.AUDIO;
   if (mimeType.startsWith("image/")) return FILE_TYPE.IMAGE;
   if (mimeType.startsWith("video/")) return FILE_TYPE.VIDEO;
   if (mimeType === "application/pdf" || extension === ".pdf") return FILE_TYPE.PDF;

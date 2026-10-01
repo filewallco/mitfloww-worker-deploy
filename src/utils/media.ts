@@ -30,6 +30,31 @@ const VIDEO_EXTENSIONS = new Set([
   '.mxf',
 ]);
 
+
+const AUDIO_EXTENSIONS = new Set([
+  '.mp3',
+  '.wav',
+  '.ogg',
+  '.m4a',
+  '.aac',
+  '.flac',
+]);
+
+const AUDIO_MIME_TYPES = new Set([
+  'audio/mpeg',
+  'audio/mp3',
+  'audio/wav',
+  'audio/x-wav',
+  'audio/wave',
+  'audio/ogg',
+  'application/ogg',
+  'audio/x-m4a',
+  'audio/mp4',
+  'audio/aac',
+  'audio/flac',
+  'audio/x-flac',
+]);
+
 const PDF_EXTENSIONS = new Set([
   '.pdf',
 ]);
@@ -151,6 +176,7 @@ export function classifyFileType(
   if (ext && IMAGE_EXTENSIONS.has(ext)) return FILE_TYPE.IMAGE;
   if (ext && VIDEO_EXTENSIONS.has(ext)) return FILE_TYPE.VIDEO;
   if (ext && PDF_EXTENSIONS.has(ext)) return FILE_TYPE.PDF;
+  if (ext && AUDIO_EXTENSIONS.has(ext)) return FILE_TYPE.AUDIO;
 
   return FILE_TYPE.OTHER;
 }
@@ -179,7 +205,14 @@ export function assertAllowedMediaInput(
     throw new Error(`MIME and extension mismatch: ${normalizedMime} ${ext}`);
   }
 
-  if (fileType === FILE_TYPE.IMAGE) {
+    if (fileType === FILE_TYPE.AUDIO) {
+    if (!AUDIO_EXTENSIONS.has(ext) || (normalizedMime && !AUDIO_MIME_TYPES.has(normalizedMime))) {
+      throw new Error(`Unsupported audio extension: ${ext}`);
+    }
+    return;
+  }
+
+if (fileType === FILE_TYPE.IMAGE) {
     if (!IMAGE_EXTENSIONS.has(ext) || (normalizedMime && !IMAGE_MIME_TYPES.has(normalizedMime))) {
       throw new Error(`Unsupported image extension: ${ext}`);
     }

@@ -41,6 +41,7 @@ export const QUEUE_NAME = {
 
 // File types
 export const FILE_TYPE = {
+  AUDIO: 'audio',
   VIDEO: 'video',
   IMAGE: 'image',
   PDF: 'pdf',
