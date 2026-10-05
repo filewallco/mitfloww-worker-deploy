@@ -5,7 +5,7 @@ import { handleJob } from './handler';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
-const imageWorker = new Worker(
+export const imageWorker = new Worker(
   'image-files',
   async (job, token) => {
     logger.info('IMAGE worker picked up job', { jobId: job.id, data: job.data?.fileId });

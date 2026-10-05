@@ -32,10 +32,10 @@ export const config = {
   tempDir: process.env.TEMP_DIR || path.join(process.cwd(), 'tmp'),
   outputDir: process.env.OUTPUT_DIR || path.join(process.cwd(), 'outputs'),
 
-  fast: num('FAST_CONCURRENCY', 2),
-  medium: num('MEDIUM_CONCURRENCY', 2),
-  heavy: num('HEAVY_CONCURRENCY', 1),
-  image: num('IMAGE_CONCURRENCY', 4),
+  fast: num('FAST_CONCURRENCY', num('WORKER_CONCURRENCY', 2)),
+  medium: num('MEDIUM_CONCURRENCY', num('WORKER_CONCURRENCY', 2)),
+  heavy: num('HEAVY_CONCURRENCY', Math.min(num('WORKER_CONCURRENCY', 1), 1)),
+  image: num('IMAGE_CONCURRENCY', num('WORKER_CONCURRENCY', 4)),
 
   rateLimit: {
     max: num('RATE_LIMIT_MAX', 10),

@@ -250,7 +250,10 @@ async function resolvePreviewPayload(jobId: string) {
   return null;
 }
 
+let adminServerInstance: http.Server | null = null;
+
 export function startAdminServer() {
+  if (adminServerInstance) return adminServerInstance;
   const server = http.createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
@@ -259,6 +262,19 @@ export function startAdminServer() {
         'Access-Control-Allow-Headers': 'Range, Authorization',
       });
       return res.end();
+    }
+
+    if (req.url === '/health' && req.method === 'GET') {
+      const isRedisOk = connection.status === 'ready' || connection.status === 'connect';
+      const statusCode = isRedisOk ? 200 : 503;
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: isRedisOk ? 'ok' : 'degraded',
+        uptime: Math.floor(process.uptime()),
+        redis: connection.status,
+        timestamp: new Date().toISOString(),
+      }));
+      return;
     }
 
     if (req.url === "/jobs/status" && req.method === "POST") {
@@ -677,7 +693,28 @@ export function startAdminServer() {
     res.end();
   });
 
-  server.listen(4000, () => {
-    console.log('Admin API running on http://localhost:4000');
+  const port = Number(process.env.PORT) || 4000;
+  server.listen(port, '0.0.0.0', () => {
+    logger.info(`Admin API running on http://0.0.0.0:${port}`);
+  });
+
+  adminServerInstance = server;
+  return server;
+}
+
+export function stopAdminServer(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!adminServerInstance) {
+      resolve();
+      return;
+    }
+
+    adminServerInstance.close((err) => {
+      if (err) {
+        logger.warn('Error closing admin server', { error: err });
+      }
+      adminServerInstance = null;
+      resolve();
+    });
   });
 }

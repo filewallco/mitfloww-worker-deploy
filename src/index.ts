@@ -1,19 +1,20 @@
 import 'dotenv/config';
 import { config } from './config';
 import { recoverStuckJobs } from './server/admin';
-import { startAdminServer } from './server/http';
-import { startWS } from './server/ws';
+import { startAdminServer, stopAdminServer } from './server/http';
+import { startWS, stopWS } from './server/ws';
 import { getFreeDiskSpace } from './utils/disk';
 import { cleanupTempDir, runPeriodicMaintenance } from './utils/cleanup';
 import { logger } from './utils/logger';
+import { connection } from './queue/connection';
 
 // Import workers to initialize queues
-import './worker/fastWorker';
-import './worker/standardWorker';
-import './worker/heavyWorker';
-import './worker/imageWorker';
-import { startCallbackRetryWorker } from "./worker/callbackRetry";
-import { startPriorityScheduler } from './scheduler/priorityScheduler';
+import { fastWorker } from './worker/fastWorker';
+import { standardWorker } from './worker/standardWorker';
+import { heavyWorker } from './worker/heavyWorker';
+import { imageWorker } from './worker/imageWorker';
+import { startCallbackRetryWorker, stopCallbackRetryWorker } from './worker/callbackRetry';
+import { startPriorityScheduler, stopPriorityScheduler } from './scheduler/priorityScheduler';
 import { reconcileResourceHolders } from './worker/resourceManager';
 
 process.env.SESSION_ID = Date.now().toString();
@@ -71,7 +72,7 @@ try {
   process.exit(1);
 }
 
-setInterval(() => {
+const reconcileInterval = setInterval(() => {
   reconcileResourceHolders().catch((err) =>
     logger.error('reconcileResourceHolders failed', { error: err }),
   );
@@ -81,7 +82,7 @@ setInterval(() => {
 /**
  * Background disk manager
  */
-setInterval(async () => {
+const diskCleanupInterval = setInterval(async () => {
   try {
     const free = getFreeDiskSpace();
 
@@ -94,6 +95,90 @@ setInterval(async () => {
   }
 }, 60_000); // every 1 min
 
+/**
+ * Periodic maintenance: runs every 12 hours (purging 72h / 3-day old orphaned data)
+ */
+const maintenanceInterval = setInterval(async () => {
+  try {
+    await runPeriodicMaintenance();
+  } catch (err) {
+    logger.error('Periodic maintenance scheduled run failed', { error: err });
+  }
+}, 12 * 60 * 60 * 1000);
+
+const maintenanceTimeout = setTimeout(() => {
+  runPeriodicMaintenance().catch((err) =>
+    logger.error('Startup periodic maintenance error', { error: err }),
+  );
+}, 60_000);
+
+let isShuttingDown = false;
+
+async function handleShutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  logger.info(`Received ${signal}, initiating graceful shutdown...`, { signal });
+
+  // Force exit fallback timer in case active jobs don't complete within 60s
+  const forceExitTimer = setTimeout(() => {
+    logger.error('Graceful shutdown timed out after 60 seconds, forcing exit');
+    process.exit(1);
+  }, 60_000);
+  forceExitTimer.unref();
+
+  try {
+    // 1. Clear recurring timers
+    clearInterval(reconcileInterval);
+    clearInterval(diskCleanupInterval);
+    clearInterval(maintenanceInterval);
+    clearTimeout(maintenanceTimeout);
+    stopPriorityScheduler();
+    stopCallbackRetryWorker();
+
+    // 2. Stop accepting new jobs and wait for in-flight jobs in BullMQ workers
+    logger.info('Closing BullMQ workers (waiting for active jobs)...');
+    await Promise.allSettled([
+      fastWorker.close(),
+      standardWorker.close(),
+      heavyWorker.close(),
+      imageWorker.close(),
+    ]);
+    logger.info('BullMQ workers closed cleanly');
+
+    // 3. Stop HTTP and WebSocket servers
+    logger.info('Stopping HTTP admin server and WebSocket server...');
+    await Promise.allSettled([
+      stopAdminServer(),
+      stopWS(),
+    ]);
+
+    // 4. Run cleanup on any remaining temp files
+    try {
+      await cleanupTempDir();
+    } catch (cleanupErr) {
+      logger.warn('Cleanup during shutdown encountered error', { error: cleanupErr });
+    }
+
+    // 5. Close Redis connection
+    logger.info('Closing Redis connection...');
+    try {
+      await connection.quit();
+      logger.info('Redis connection closed cleanly');
+    } catch (redisErr) {
+      logger.warn('Error closing Redis connection', { error: redisErr });
+    }
+
+    logger.info('Graceful shutdown completed successfully. Exiting.');
+    process.exit(0);
+  } catch (err) {
+    logger.error('Error during graceful shutdown', { error: err });
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => void handleShutdown('SIGTERM'));
+process.on('SIGINT', () => void handleShutdown('SIGINT'));
+
 process.on('uncaughtException', (err) => {
   try {
     logger.fatal('uncaughtException', { error: err, sessionId: process.env.SESSION_ID });
@@ -105,21 +190,3 @@ process.on('unhandledRejection', (reason) => {
     logger.fatal('unhandledRejection', { reason, sessionId: process.env.SESSION_ID });
   } catch {}
 });
-
-
-/**
- * Periodic maintenance: runs every 12 hours (purging 72h / 3-day old orphaned data)
- */
-setInterval(async () => {
-  try {
-    await runPeriodicMaintenance();
-  } catch (err) {
-    logger.error('Periodic maintenance scheduled run failed', { error: err });
-  }
-}, 12 * 60 * 60 * 1000);
-
-setTimeout(() => {
-  runPeriodicMaintenance().catch((err) =>
-    logger.error('Startup periodic maintenance error', { error: err }),
-  );
-}, 60_000);

@@ -4,6 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -22,13 +25,13 @@
     "multer": "^2.1.1",
     "pdf-lib": "^1.17.1",
     "pg": "^8.23.0",
+    "sharp": "^0.34.5",
     "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
     "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.1",
-    "sharp": "^0.34.5",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.2"
   }

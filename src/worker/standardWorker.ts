@@ -8,7 +8,7 @@ import { logger } from '../utils/logger';
 /**
  * Worker for MEDIUM files
  */
-const standardWorker = new Worker(
+export const standardWorker = new Worker(
   'medium-files',
   async (job, token) => {
     logger.info('STANDARD worker picked up job', { jobId: job.id, data: job.data?.fileId });

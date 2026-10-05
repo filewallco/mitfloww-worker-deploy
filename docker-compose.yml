@@ -1,0 +1,44 @@
+name: mitfloww-worker
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mitfloww-worker:latest
+    container_name: mitfloww-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    # Graceful shutdown configuration:
+    # Allow active video/media processing jobs up to 60s to cleanly finalize before SIGKILL
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
+    # Security hardening & permissions:
+    # Ports are bound strictly to localhost (127.0.0.1) to prevent public internet exposure
+    ports:
+      - "127.0.0.1:${PORT:-4000}:${PORT:-4000}"
+      - "127.0.0.1:${WS_PORT:-4002}:${WS_PORT:-4002}"
+    volumes:
+      # Ephemeral temp directory for processing files
+      - worker-tmp:/app/tmp
+      # Output storage (used when STORAGE_PROVIDER=local or server)
+      - worker-outputs:/app/outputs
+      # Persistent operational logs
+      - worker-logs:/app/logs
+    # Log rotation to prevent disk exhaustion
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  worker-tmp:
+    driver: local
+  worker-outputs:
+    driver: local
+  worker-logs:
+    driver: local

@@ -276,6 +276,122 @@ pnpm ts-node src/index.ts
 
 ---
 
+## 🐳 Production Docker Deployment (Oracle Cloud ARM64 / Ubuntu)
+
+The worker is fully containerized using a multi-stage, non-root Docker architecture compatible with both `linux/arm64` (Oracle Cloud Ampere A1) and `linux/amd64`.
+
+### 1. Install Docker & Docker Compose
+On Ubuntu / Debian (x86_64 or aarch64):
+```bash
+# Update and install Docker
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify Docker installation
+docker --version
+docker compose version
+```
+
+### 2. Clone Worker Repository
+```bash
+git clone <repository-url> mitfloww
+cd mitfloww/worker
+```
+
+### 3. Create .env
+```bash
+cp .env.example .env
+```
+
+### 4. Configure Secrets
+Edit `.env` and provide production secrets:
+```bash
+nano .env
+```
+Ensure the following variables are configured:
+- `REDIS_URL`: Connection string to your production Redis instance (e.g., `redis://:password@redis.internal:6379`).
+- `WORKER_API_TOKEN`: Shared secret for internal Next.js API requests.
+- `PROCESSING_CALLBACK_TOKEN`: Secret used when reporting job results back to Next.js API.
+- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`: Cloudflare R2 credentials.
+- `R2_PUBLIC_BASE_URL`: Public CDN / R2 domain for media streaming.
+
+### 5. Build Image
+Build the container image locally:
+```bash
+docker compose build
+```
+
+To build specifically for ARM64 using Docker Buildx:
+```bash
+docker buildx build --platform linux/arm64 -t mitfloww-worker:latest .
+```
+
+### 6. Start Worker
+Start the worker in detached background mode:
+```bash
+docker compose up -d
+```
+
+Verify the container status:
+```bash
+docker compose ps
+```
+
+### 7. Check Logs
+Monitor real-time worker logs:
+```bash
+docker compose logs -f worker
+```
+
+Verify internal versions and health inside the container:
+```bash
+docker compose exec worker node --version
+docker compose exec worker ffmpeg -version
+docker compose exec worker node -e "const http = require('http'); http.get('http://127.0.0.1:4000/health', (res) => { res.pipe(process.stdout); });"
+```
+
+### 8. Update & Redeploy
+When deploying new code changes:
+```bash
+git pull origin main
+docker compose up -d --build
+docker compose logs -f worker
+```
+
+### 9. Restart Worker
+Restart worker cleanly (triggers `SIGTERM` graceful shutdown):
+```bash
+docker compose restart worker
+```
+To stop the service:
+```bash
+docker compose down
+```
+
+### 10. Troubleshooting
+
+- **Container fails health check:**
+  Check container logs:
+  ```bash
+  docker compose logs --tail=100 worker
+  ```
+  Ensure Redis is reachable from inside the container.
+
+- **Redis connection errors:**
+  Verify that `REDIS_URL` in `.env` is accessible and any Redis firewall / VPC security lists allow incoming connections on port 6379.
+
+- **FFmpeg encoding errors:**
+  Inspect job logs in Redis or container output. Verify that `FFMPEG_MAX_THREADS` is set appropriately for your VM size (e.g. 2 for 4-vCPU VM).
+
+- **Temporary disk fill-up:**
+  Worker temp directory is mounted on the `worker-tmp` volume. The worker runs automatic cleanup every 60s and emergency disk cleanup when space drops below `TARGET_FREE_DISK`. To inspect volume size:
+  ```bash
+  docker system df -v
+  ```
+
+---
+
 ## 🧭 Summary
 
 This system is designed for:

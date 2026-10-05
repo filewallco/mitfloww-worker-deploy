@@ -62,8 +62,11 @@ async function rebalanceQueue(queue: any) {
  * - Batch-limited scans to avoid Redis overload
  * - Eventually consistent fairness (not real-time)
  */
+let schedulerInterval: NodeJS.Timeout | null = null;
+
 export function startPriorityScheduler() {
-  setInterval(async () => {
+  if (schedulerInterval) return;
+  schedulerInterval = setInterval(async () => {
     await Promise.all([
       rebalanceQueue(smallQueue),
       rebalanceQueue(mediumQueue),
@@ -71,4 +74,11 @@ export function startPriorityScheduler() {
       rebalanceQueue(imageQueue),
     ]);
   }, 60_000);
+}
+
+export function stopPriorityScheduler() {
+  if (schedulerInterval) {
+    clearInterval(schedulerInterval);
+    schedulerInterval = null;
+  }
 }

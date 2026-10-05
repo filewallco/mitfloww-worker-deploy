@@ -8,7 +8,7 @@ import { logger } from '../utils/logger';
 /**
  * Worker for LARGE files (heavy processing)
  */
-const heavyWorker = new Worker(
+export const heavyWorker = new Worker(
   'large-files',
   async (job, token) => {
     logger.info('HEAVY worker picked up job', { jobId: job.id, data: job.data?.fileId });

@@ -9,7 +9,7 @@ import { logger } from '../utils/logger';
  * Worker for SMALL files (fast lane)
  * Dedicated queue → no filtering needed
  */
-const fastWorker = new Worker(
+export const fastWorker = new Worker(
   'small-files',
   async (job, token) => {
     logger.info('FAST worker picked up job', { jobId: job.id, data: job.data?.fileId });
