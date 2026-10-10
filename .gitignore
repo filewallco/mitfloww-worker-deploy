@@ -64,3 +64,5 @@ outputs/
 # -----------------------------
 combine-src.js
 combined.txt
+scripts/
+/scripts
