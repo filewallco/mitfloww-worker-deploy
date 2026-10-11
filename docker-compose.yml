@@ -1,6 +1,31 @@
 name: mitfloww-worker
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: mitfloww-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redispassword}
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - internal-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redispassword}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
   worker:
     build:
       context: .
@@ -8,19 +33,23 @@ services:
     image: mitfloww-worker:latest
     container_name: mitfloww-worker
     restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
     env_file:
       - .env
     environment:
       - NODE_ENV=production
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redispassword}@redis:6379
     # Graceful shutdown configuration:
-    # Allow active video/media processing jobs up to 60s to cleanly finalize before SIGKILL
     stop_signal: SIGTERM
     stop_grace_period: 60s
-    # Security hardening & permissions:
-    # Ports are bound strictly to localhost (127.0.0.1) to prevent public internet exposure
+    # Expose worker ports:
+    # Set to 127.0.0.1:4000 if using Cloudflare Tunnel or reverse proxy on host,
+    # or ${PORT:-4000}:${PORT:-4000} to allow direct external access.
     ports:
-      - "127.0.0.1:${PORT:-4000}:${PORT:-4000}"
-      - "127.0.0.1:${WS_PORT:-4002}:${WS_PORT:-4002}"
+      - "${PORT:-4000}:${PORT:-4000}"
+      - "${WS_PORT:-4002}:${WS_PORT:-4002}"
     volumes:
       # Ephemeral temp directory for processing files
       - worker-tmp:/app/tmp
@@ -28,6 +57,8 @@ services:
       - worker-outputs:/app/outputs
       # Persistent operational logs
       - worker-logs:/app/logs
+    networks:
+      - internal-net
     # Log rotation to prevent disk exhaustion
     logging:
       driver: "json-file"
@@ -35,7 +66,13 @@ services:
         max-size: "50m"
         max-file: "5"
 
+networks:
+  internal-net:
+    driver: bridge
+
 volumes:
+  redis-data:
+    driver: local
   worker-tmp:
     driver: local
   worker-outputs:
