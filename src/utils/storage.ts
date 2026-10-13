@@ -47,6 +47,17 @@ export async function downloadObject(input: {
   onProgress?: (bytes: number, total?: number) => void;
 }) {
   if (isLocal()) {
+    try {
+      const existingStat = await fs.stat(input.dest);
+      if (input.expectedBytes && existingStat.size === input.expectedBytes) {
+        logger.info("Local cached file already exists, reusing", { bucket: input.bucket, key: input.key, size: existingStat.size });
+        if (input.onProgress) {
+          input.onProgress(existingStat.size, existingStat.size);
+        }
+        return;
+      }
+    } catch {}
+
     const src = getLocalPath(input.bucket, input.key);
     logger.info("Local download started", { bucket: input.bucket, key: input.key });
     

@@ -110,7 +110,7 @@ export async function cleanupTempDir() {
   const entries = await fs.promises.readdir(dir, { withFileTypes: true });
   const folders = await Promise.all(
     entries
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => entry.isDirectory() && entry.name !== 'sources')
       .map(async (entry) => {
         const fullPath = path.join(dir, entry.name);
         const stat = await fs.promises.stat(fullPath);
@@ -174,7 +174,7 @@ export async function runPeriodicMaintenance(
     try {
       const entries = await fs.promises.readdir(dir, { withFileTypes: true });
       for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
+        if (!entry.isDirectory() || entry.name === 'sources') continue;
         const fullPath = path.join(dir, entry.name);
         const stat = await fs.promises.stat(fullPath).catch(() => null);
         if (!stat) continue;

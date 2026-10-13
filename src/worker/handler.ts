@@ -39,6 +39,7 @@ import {
 } from "../utils/storage";
 import { recordProcessingDuration } from "../utils/eta";
 import { buildTraceableWatermarkText } from "../utils/watermark";
+import { getSourceCacheKey, getSourceCachePath } from "../utils/sourceCache";
 import {
   CorruptInputError,
   DiskUnavailableError,
@@ -757,24 +758,32 @@ export async function handleJob(
       });
     };
 
+    const sourceCacheKey = getSourceCacheKey({
+      fileVersionId: job.fileVersionId,
+      sourceKey: job.sourceKey,
+      fileId: job.fileId,
+    });
+    const cachedSourcePath = getSourceCachePath(sourceCacheKey);
+
     if (job.sourceBucket && job.sourceKey) {
-      logger.info("Starting download", {
+      logger.info("Starting download to source cache", {
         bucket: job.sourceBucket,
         key: job.sourceKey,
+        cachedSourcePath,
       });
 
       await downloadObject({
         bucket: job.sourceBucket,
         key: job.sourceKey,
-        dest: rawInputPath,
+        dest: cachedSourcePath,
         expectedBytes: expectedSourceBytes,
         maxBytes: config.security.maxUploadBytes,
         onProgress: onDownloadProgress,
       });
 
-      logger.info("Download completed");
+      logger.info("Download completed in source cache");
     } else if (job.inputUrl) {
-      await download(job.inputUrl, rawInputPath, {
+      await download(job.inputUrl, cachedSourcePath, {
         expectedBytes: expectedSourceBytes,
         maxBytes: config.security.maxUploadBytes,
         onProgress: onDownloadProgress,
@@ -783,6 +792,14 @@ export async function handleJob(
       throw new SourceMissingError("Missing source object");
     }
 
+    // Materialize into job working directory
+    await fs.promises.mkdir(tempDir, { recursive: true });
+    try {
+      await fs.promises.unlink(rawInputPath).catch(() => {});
+      await fs.promises.link(cachedSourcePath, rawInputPath);
+    } catch {
+      await fs.promises.copyFile(cachedSourcePath, rawInputPath);
+    }
     const materialized = await materializeInputPath(rawInputPath);
     safeInput = materialized.inputPath;
 

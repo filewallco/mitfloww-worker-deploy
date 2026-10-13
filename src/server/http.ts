@@ -10,6 +10,7 @@ import path from 'path';
 import { FILE_TYPE, JOB_STAGE, JOB_STATUS, REDIS_KEYS } from '../constants';
 import { imageQueue, largeQueue, mediumQueue, smallQueue } from '../queue/queues';
 import { config } from '../config';
+import { deleteSourceCache } from '../utils/sourceCache';
 import { isAdminRequestAuthorized } from '../security/auth';
 import { cancelActiveJob } from '../worker/handler';
 import { releaseDisk, releaseUserSlot } from '../worker/resourceManager';
@@ -615,6 +616,52 @@ export function startAdminServer() {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(status));
 
+      return;
+    }
+
+    if (req.url === '/sources/delete' && req.method === 'POST') {
+      if (!isWorkerRequestAuthorized(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+
+      try {
+        const body = await readJson(req);
+        const target = body.fileVersionId || body.sourceKey || body.id;
+        if (target) {
+          await deleteSourceCache(target);
+          if (body.sourceKey && body.sourceKey !== target) {
+            await deleteSourceCache(body.sourceKey);
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+        return;
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid request' }));
+        return;
+      }
+    }
+
+    if (req.url?.startsWith('/sources/') && req.method === 'DELETE') {
+      if (!isWorkerRequestAuthorized(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+
+      const id = req.url.split('/').pop();
+      if (!id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Source ID is required' }));
+        return;
+      }
+
+      const deleted = await deleteSourceCache(id);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, deleted }));
       return;
     }
 

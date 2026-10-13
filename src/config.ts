@@ -30,6 +30,7 @@ export const config = {
   ffprobePath: String(validateEnv('FFPROBE_PATH', process.env.FFPROBE_PATH || 'ffprobe')),
 
   tempDir: process.env.TEMP_DIR || path.join(process.cwd(), 'tmp'),
+  sourceCacheDir: process.env.SOURCE_CACHE_DIR || path.join(process.env.TEMP_DIR || path.join(process.cwd(), 'tmp'), 'sources'),
   outputDir: process.env.OUTPUT_DIR || path.join(process.cwd(), 'outputs'),
 
   fast: num('FAST_CONCURRENCY', num('WORKER_CONCURRENCY', 2)),
@@ -102,4 +103,5 @@ export const config = {
 };
 
 if (!fs.existsSync(config.tempDir)) fs.mkdirSync(config.tempDir, { recursive: true });
+if (!fs.existsSync(config.sourceCacheDir)) fs.mkdirSync(config.sourceCacheDir, { recursive: true });
 if (!fs.existsSync(config.outputDir)) fs.mkdirSync(config.outputDir, { recursive: true });

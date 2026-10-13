@@ -148,10 +148,40 @@ export async function downloadFromR2(input: {
   let attempt = 0;
   let lastError: unknown = null;
 
-  // Clear any existing partial file before starting fresh
   try {
-    await fs.promises.unlink(input.dest);
-  } catch {}
+    const existingStat = await fs.promises.stat(input.dest);
+    if (existingStat.size > 0) {
+      if (expectedBytes && existingStat.size === expectedBytes) {
+        logger.info("R2 download already complete on disk, reusing existing file", {
+          bucket: input.bucket,
+          key: input.key,
+          size: existingStat.size,
+        });
+        if (input.onProgress) {
+          input.onProgress(existingStat.size, existingStat.size);
+        }
+        return;
+      }
+
+      if (!expectedBytes || existingStat.size < expectedBytes) {
+        writtenBytes = existingStat.size;
+        logger.info("Found partial R2 download on disk, will resume from existing offset", {
+          bucket: input.bucket,
+          key: input.key,
+          writtenBytes,
+          expectedBytes,
+        });
+        if (input.onProgress) {
+          input.onProgress(writtenBytes, expectedBytes ?? undefined);
+        }
+      } else {
+        await fs.promises.unlink(input.dest).catch(() => {});
+        writtenBytes = 0;
+      }
+    }
+  } catch {
+    writtenBytes = 0;
+  }
 
   while (attempt < maxDownloadAttempts) {
     attempt++;
